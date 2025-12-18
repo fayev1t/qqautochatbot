@@ -159,7 +159,15 @@ async def handle_group_chat(bot: Bot, event: GroupMessageEvent) -> None:
                 group_id=group_id,
             )
 
-            # 4. Send response
+            # 4. Skip if response is empty (should_reply was False)
+            if not response.strip():
+                logger.debug(
+                    f"[group_chat] Response is empty, not sending",
+                    extra={"group_id": group_id},
+                )
+                return
+
+            # 5. Send response
             await group_chat_handler.send(response)
 
             logger.info(

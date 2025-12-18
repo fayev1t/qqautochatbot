@@ -238,7 +238,6 @@ nb run
 # 启动成功标志：应看到日志 "Performing startup..."
 ```
 
-**注意**: Claude Code 运行在 Windows 上，通过 SFTP 连接服务器。**无法直接安装依赖**，依赖应预先在服务器环境中安装。
 
 ---
 

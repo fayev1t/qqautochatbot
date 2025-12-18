@@ -60,11 +60,6 @@ class ConversationService:
         Returns:
             Generated response text (with @ mention if applicable)
         """
-        # 重要：如果判断模块说不应该回复，直接返回空字符串
-        if not judge_result.should_reply:
-            logger.debug(f"[conversation] should_reply=False, skipping response generation")
-            return ""
-
         try:
             llm = await self._get_llm()
 

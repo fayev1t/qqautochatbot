@@ -137,8 +137,8 @@ async def handle_group_chat(bot: Bot, event: GroupMessageEvent) -> None:
             )
 
 
-            # Early exit if no reply needed (unless user is complaining, need apology)
-            if not judge_result.should_reply and not judge_result.user_complaining_too_much:
+            # Early exit if no reply needed
+            if not judge_result.should_reply:
                 logger.debug(
                     f"[group_chat] Not replying: {judge_result.explanation}",
                     extra={"group_id": group_id},

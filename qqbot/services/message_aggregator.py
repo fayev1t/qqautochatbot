@@ -148,7 +148,7 @@ class MessageAggregator:
                     history_context = await ContextManager.get_recent_context(
                         session=session,
                         group_id=group_id,
-                        limit=20,  # 最近20条消息作为上下文
+                        limit=30,  # 与 group_chat.py 中的判断保持一致
                         bot_id=block.messages[0].event.self_id if block.messages else None,
                     )
             except Exception as e:
@@ -172,10 +172,12 @@ class MessageAggregator:
 
             from langchain_openai import ChatOpenAI
             from langchain_core.messages import HumanMessage
+            from qqbot.core.llm import LLMConfig
 
+            config = LLMConfig()
             llm = ChatOpenAI(
-                model_name="deepseek-chat",
-                api_key="sk-01b278c1d5ea48ef8dbfbd705d52349b",
+                model_name=config.llm_model,
+                api_key=config.llm_api_key,
                 base_url="https://api.deepseek.com/v1",
                 temperature=0.5,
             )

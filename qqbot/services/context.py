@@ -1,7 +1,6 @@
 """Context extraction and formatting for conversation system."""
 
 from datetime import datetime
-from typing import Optional
 import re
 
 from sqlalchemy.ext.asyncio import AsyncSession

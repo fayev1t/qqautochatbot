@@ -1,6 +1,6 @@
 """LLM configuration and initialization."""
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from pydantic_settings import BaseSettings
 
@@ -23,7 +23,7 @@ class LLMConfig(BaseSettings):
         extra = "ignore"
 
 
-async def create_llm() -> Optional["LLM"]:
+async def create_llm() -> "LLM | None":
     """Create and return LLM instance based on config.
 
     Returns:

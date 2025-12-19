@@ -10,7 +10,7 @@ from qqbot.core.llm import LLMConfig, create_llm
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.prompt import PromptManager
 from qqbot.services.user import UserService
-from qqbot.services.message_judge import JudgeResult
+from qqbot.services.block_judge import JudgeResult
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +73,6 @@ class ConversationService:
 【回复要求】
 - 情绪: {judge_result.emotion}
 - 回复类型: {judge_result.reply_type}"""
-
-            # Add special handling for user feedback
-            if judge_result.user_complaining_too_much:
-                response_prompt += "\n\n【特殊情况：用户抱怨说话太多】用户表达了对你说话过于频繁的不满。请生成一个真挚的道歉回复，表示你会改正，并表现出你在意用户的感受。回复应该既有歉意也要保持你的人格特点。"
-            elif judge_result.user_asking_to_speak:
-                response_prompt += "\n\n【特殊情况：用户催促说话】用户在问为什么你不说话或希望你更活跃。请生成一个回应，解释为什么你最近沉默，并表现出你正在改变。"
 
             response_prompt += "\n\n请根据以上信息生成一条自然的群聊回复。注意保持小奏的人格特征。"
 

@@ -126,6 +126,12 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
+# Editor swap files
+*.swp
+*.swo
+*~
+.DS_Store
+
 # mkdocs documentation
 /site
 

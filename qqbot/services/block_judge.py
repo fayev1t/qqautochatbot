@@ -19,6 +19,71 @@ from qqbot.services.silence_mode import is_silent, set_silent
 logger = logging.getLogger(__name__)
 
 
+class JudgeResult:
+    """Result of message judgment analysis (legacy compatibility class).
+
+    Used to maintain compatibility with ConversationService which expects
+    this format. New code should use BlockJudgeResult instead.
+    """
+
+    def __init__(
+        self,
+        should_reply: bool,
+        reply_type: str,
+        target_user_id: int | None = None,
+        emotion: str = "happy",
+        explanation: str = "",
+        instruction: str = "",
+        should_mention: bool = False,
+        user_complaining_too_much: bool = False,
+        user_asking_to_speak: bool = False,
+    ) -> None:
+        """Initialize judgment result.
+
+        Args:
+            should_reply: Whether bot should reply to this message
+            reply_type: Type of reply - "person", "topic", "knowledge", or "none"
+            target_user_id: If replying to a person, their QQ ID
+            emotion: Emotion for the response - happy/serious/sarcastic/confused/gentle
+            explanation: Explanation of the judgment decision
+            instruction: Instructions for the response generation layer
+            should_mention: Whether to @ mention the target user (only in special cases)
+            user_complaining_too_much: User is complaining bot talks too much
+            user_asking_to_speak: User is asking bot to speak more
+        """
+        self.should_reply = should_reply
+        self.reply_type = reply_type
+        self.target_user_id = target_user_id
+        self.emotion = emotion
+        self.explanation = explanation
+        self.instruction = instruction
+        self.should_mention = should_mention
+        self.user_complaining_too_much = user_complaining_too_much
+        self.user_asking_to_speak = user_asking_to_speak
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JudgeResult":
+        """Create JudgeResult from dictionary.
+
+        Args:
+            data: Dictionary with judgment result fields
+
+        Returns:
+            JudgeResult instance
+        """
+        return cls(
+            should_reply=data.get("should_reply", False),
+            reply_type=data.get("reply_type", "none"),
+            target_user_id=data.get("target_user_id"),
+            emotion=data.get("emotion", "happy"),
+            explanation=data.get("explanation", ""),
+            instruction=data.get("instruction", ""),
+            should_mention=data.get("should_mention", False),
+            user_complaining_too_much=data.get("user_complaining_too_much", False),
+            user_asking_to_speak=data.get("user_asking_to_speak", False),
+        )
+
+
 @dataclass
 class ReplyPlan:
     """单次回复的计划"""
@@ -40,8 +105,8 @@ class BlockJudgeResult:
     block_summary: str
     replies: list[ReplyPlan] = field(default_factory=list)
     explanation: str = ""
-    user_complaining_too_much: bool = False
-    user_asking_to_speak: bool = False
+    should_enter_silence_mode: bool = False
+    should_exit_silence_mode: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlockJudgeResult":
@@ -72,8 +137,8 @@ class BlockJudgeResult:
             block_summary=data.get("block_summary", ""),
             replies=replies,
             explanation=data.get("explanation", ""),
-            user_complaining_too_much=data.get("user_complaining_too_much", False),
-            user_asking_to_speak=data.get("user_asking_to_speak", False),
+            should_enter_silence_mode=data.get("should_enter_silence_mode", False),
+            should_exit_silence_mode=data.get("should_exit_silence_mode", False),
         )
 
     @classmethod
@@ -198,7 +263,7 @@ class BlockJudger:
 
             # 如果处于沉默模式，添加额外说明
             if silence_mode:
-                system_prompt += "\n\n【特殊状态：沉默模式激活】当前群处于沉默模式，你的说话意愿应该大幅降低。只有在以下情况才应该回复：用户明确@你、用户提出直接问题、或有重要信息需要传达。"
+                system_prompt += "\n\n【特殊状态：沉默模式激活】当前群处于沉默模式，回复的判定标准应该变得严格。在这个模式下，只有在以下情况才应该判定为需要回复：用户明确@你、用户提出知识型问题、或有重要信息需要传达。其他的闲聊、话题讨论等应该判定为\'不回复\'。"
 
             logger.info(
                 f"[block_judge] Judging block with {block.get_message_count()} messages",
@@ -219,8 +284,6 @@ class BlockJudger:
             response = await llm.ainvoke(messages)
             response_text = response.content.strip()
 
-            print(f"[block_judge] API Response: {response_text}")
-
             # 解析JSON响应
             try:
                 json_start = response_text.find("{")
@@ -235,6 +298,22 @@ class BlockJudger:
                 return BlockJudgeResult.no_reply("JSON解析失败")
 
             result = BlockJudgeResult.from_dict(result_data)
+
+            # 【重要】处理沉默模式转换（在判断结果后立即执行）
+            # 这样下一条消息会立即受到沉默模式的影响
+            if group_id:
+                if result.should_enter_silence_mode:
+                    set_silent(group_id, True)
+                    logger.warning(
+                        f"[block_judge] 🔇 用户表示不想频繁收到回复，进入沉默模式（回复频率会降低）",
+                        extra={"group_id": group_id},
+                    )
+                elif result.should_exit_silence_mode:
+                    set_silent(group_id, False)
+                    logger.info(
+                        f"[block_judge] 🔊 用户希望AI恢复正常回复频率，退出沉默模式",
+                        extra={"group_id": group_id},
+                    )
 
             # 记录判断结果
             msg = f"[block_judge] ======== 对话块判断完成 ========"
@@ -275,21 +354,6 @@ class BlockJudger:
                     msg = f"[block_judge]   针对内容: {reply_plan.related_messages}"
                     logger.info(msg, extra={"group_id": group_id})
                     print(msg)
-
-            # 处理沉默模式转换
-            if group_id:
-                if result.user_complaining_too_much:
-                    set_silent(group_id, True)
-                    logger.warning(
-                        f"[block_judge] ⚠️ 进入沉默模式: 用户抱怨说话太多",
-                        extra={"group_id": group_id},
-                    )
-                elif result.user_asking_to_speak:
-                    set_silent(group_id, False)
-                    logger.info(
-                        f"[block_judge] ℹ️ 退出沉默模式: 用户催促说话",
-                        extra={"group_id": group_id},
-                    )
 
             return result
 

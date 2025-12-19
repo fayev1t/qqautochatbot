@@ -34,8 +34,7 @@ from qqbot.services.message_aggregator import (
     ResponseBlock,
     message_aggregator,
 )
-from qqbot.services.block_judge import block_judger, ReplyPlan
-from qqbot.services.message_judge import JudgeResult
+from qqbot.services.block_judge import block_judger, ReplyPlan, JudgeResult
 
 logger = logging.getLogger(__name__)
 

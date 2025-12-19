@@ -209,10 +209,11 @@ qqbot/
 
 ## 🚀 快速开始
 
+docker?(❌) requstment?(❌) 直接把小奏（1005089717）拉到群里
+
+##  🐢慢速开始
 ### 前置条件
-- Python 3.9+
-- PostgreSQL 容器化部署
-- napcat Docker 容器化部署
+- Nonebot环境（缺什么依赖装什么）
 
 ### 环境配置
 

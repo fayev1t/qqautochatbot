@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# 环境变量（通过docker-compose注入）
+.env.dev
+.env.prod
+
+# 开发工具
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+.DS_Store
+
+# 文档
+README.md
+CLAUDE.md
+ARCHITECTURE.md
+DATABASE_DESIGN.md
+CONVERSATION_IMPLEMENTATION.md
+DOCKER.md
+*.md
+
+# 图片和媒体
+img/
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Git
+.git/
+.gitignore
+
+# 日志
+logs/
+*.log
+
+# IDE
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 其他
+.github/
+tests/

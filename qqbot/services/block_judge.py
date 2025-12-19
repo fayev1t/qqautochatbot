@@ -1,0 +1,302 @@
+"""对话块判断服务 - 分析聚合的消息块，决定回复策略
+
+替代原来的单消息判断（message_judge.py），改为对整个对话块进行判断。
+"""
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from qqbot.core.llm import LLMConfig
+from qqbot.services.message_aggregator import ResponseBlock
+from qqbot.services.prompt import PromptManager
+from qqbot.services.silence_mode import is_silent, set_silent
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReplyPlan:
+    """单次回复的计划"""
+
+    reply_type: str  # "person" / "topic" / "knowledge"
+    target_user_id: int | None = None
+    emotion: str = "happy"
+    instruction: str = ""
+    should_mention: bool = False
+    related_messages: str = ""
+
+
+@dataclass
+class BlockJudgeResult:
+    """对话块判断结果"""
+
+    should_reply: bool
+    reply_count: int
+    block_summary: str
+    replies: list[ReplyPlan] = field(default_factory=list)
+    explanation: str = ""
+    user_complaining_too_much: bool = False
+    user_asking_to_speak: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BlockJudgeResult":
+        """从字典创建结果对象
+
+        Args:
+            data: 包含判断结果的字典
+
+        Returns:
+            BlockJudgeResult实例
+        """
+        replies = []
+        for r in data.get("replies", []):
+            replies.append(
+                ReplyPlan(
+                    reply_type=r.get("reply_type", "topic"),
+                    target_user_id=r.get("target_user_id"),
+                    emotion=r.get("emotion", "happy"),
+                    instruction=r.get("instruction", ""),
+                    should_mention=r.get("should_mention", False),
+                    related_messages=r.get("related_messages", ""),
+                )
+            )
+
+        return cls(
+            should_reply=data.get("should_reply", False),
+            reply_count=data.get("reply_count", 0),
+            block_summary=data.get("block_summary", ""),
+            replies=replies,
+            explanation=data.get("explanation", ""),
+            user_complaining_too_much=data.get("user_complaining_too_much", False),
+            user_asking_to_speak=data.get("user_asking_to_speak", False),
+        )
+
+    @classmethod
+    def no_reply(cls, reason: str = "") -> "BlockJudgeResult":
+        """创建一个不回复的结果
+
+        Args:
+            reason: 不回复的原因
+
+        Returns:
+            表示不回复的BlockJudgeResult
+        """
+        return cls(
+            should_reply=False,
+            reply_count=0,
+            block_summary="",
+            replies=[],
+            explanation=reason,
+        )
+
+
+class BlockJudger:
+    """对话块判断服务 - 分析整个对话块决定回复策略"""
+
+    def __init__(self) -> None:
+        """初始化判断服务"""
+        self.config = LLMConfig()
+        self.prompt_manager = PromptManager()
+        self._llm = None
+
+    async def _get_llm(self) -> Any:
+        """获取或创建LLM实例
+
+        Returns:
+            LLM实例
+        """
+        if self._llm is None:
+            from langchain_openai import ChatOpenAI
+
+            # 使用较低的temperature保证判断的稳定性
+            self._llm = ChatOpenAI(
+                model_name=self.config.llm_model,
+                api_key=self.config.llm_api_key,
+                base_url="https://api.deepseek.com/v1",
+                temperature=0.5,
+            )
+        return self._llm
+
+    def _format_block_messages(
+        self,
+        block: ResponseBlock,
+        user_names: dict[int, str] | None = None,
+    ) -> str:
+        """格式化对话块中的消息
+
+        Args:
+            block: 对话响应块
+            user_names: 用户ID到昵称的映射
+
+        Returns:
+            格式化的消息文本
+        """
+        user_names = user_names or {}
+        lines = []
+
+        for msg in block.messages:
+            user_name = user_names.get(msg.user_id, f"用户{msg.user_id}")
+            mention_tag = " 【@小奏】" if msg.is_bot_mentioned else ""
+            lines.append(f"{user_name}({msg.user_id}){mention_tag}: {msg.message_content}")
+
+        return "\n".join(lines)
+
+    async def judge_block(
+        self,
+        block: ResponseBlock,
+        context: str,
+        group_id: int | None = None,
+        user_names: dict[int, str] | None = None,
+    ) -> BlockJudgeResult:
+        """判断对话块是否需要回复，以及如何回复
+
+        Args:
+            block: 对话响应块
+            context: 历史上下文（从数据库获取的最近消息）
+            group_id: 群ID（用于沉默模式管理）
+            user_names: 用户ID到昵称的映射
+
+        Returns:
+            BlockJudgeResult包含回复策略
+        """
+        try:
+            # 检查块是否为空
+            if block.get_message_count() == 0:
+                return BlockJudgeResult.no_reply("对话块为空")
+
+            llm = await self._get_llm()
+
+            # 检查沉默模式
+            silence_mode = is_silent(group_id) if group_id else False
+
+            # 格式化对话块消息
+            block_content = self._format_block_messages(block, user_names)
+
+            # 构建用户提示
+            user_prompt = f"""【历史上下文】
+{context}
+
+【当前对话块】（{block.get_message_count()}条消息，来自{len(block.get_unique_users())}个用户）
+{block_content}
+
+请分析这个对话块并判断：
+1. 是否需要回复？
+2. 如果需要回复，需要回复几次？（通常1次就够）
+3. 每次回复针对什么内容，用什么情绪？
+4. 用户是否在抱怨AI说话太多？
+5. 用户是否在催促AI说话？
+
+输出JSON格式的判断结果。"""
+
+            # 获取系统提示词
+            system_prompt = self.prompt_manager.block_judge_prompt
+
+            # 如果处于沉默模式，添加额外说明
+            if silence_mode:
+                system_prompt += "\n\n【特殊状态：沉默模式激活】当前群处于沉默模式，你的说话意愿应该大幅降低。只有在以下情况才应该回复：用户明确@你、用户提出直接问题、或有重要信息需要传达。"
+
+            logger.info(
+                f"[block_judge] Judging block with {block.get_message_count()} messages",
+                extra={
+                    "group_id": group_id,
+                    "message_count": block.get_message_count(),
+                    "unique_users": len(block.get_unique_users()),
+                    "silence_mode": silence_mode,
+                },
+            )
+
+            # 调用LLM
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ]
+
+            response = await llm.ainvoke(messages)
+            response_text = response.content.strip()
+
+            print(f"[block_judge] API Response: {response_text}")
+
+            # 解析JSON响应
+            try:
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_text[json_start:json_end]
+                    result_data = json.loads(json_str)
+                else:
+                    raise ValueError("No JSON found in response")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"[block_judge] JSON解析失败: {response_text}\n{e}")
+                return BlockJudgeResult.no_reply("JSON解析失败")
+
+            result = BlockJudgeResult.from_dict(result_data)
+
+            # 记录判断结果
+            msg = f"[block_judge] ======== 对话块判断完成 ========"
+            logger.info(msg, extra={"group_id": group_id, "should_reply": result.should_reply, "reply_count": result.reply_count})
+            print(msg)
+
+            msg = f"[block_judge] 块摘要: {result.block_summary}"
+            logger.info(msg, extra={"group_id": group_id})
+            print(msg)
+
+            msg = f"[block_judge] 判断结果: 需要回复={result.should_reply}, 回复次数={result.reply_count}, 原因={result.explanation}"
+            logger.info(msg, extra={
+                "group_id": group_id,
+                "should_reply": result.should_reply,
+                "reply_count": result.reply_count,
+            })
+            print(msg)
+
+            # 详细输出每个回复计划
+            if result.should_reply and result.replies:
+                msg = f"[block_judge] 回复计划详情 (共{len(result.replies)}条回复):"
+                logger.info(msg, extra={"group_id": group_id})
+                print(msg)
+                for idx, reply_plan in enumerate(result.replies, 1):
+                    msg = f"[block_judge] 【回复 {idx}】类型={reply_plan.reply_type}, 态度={reply_plan.emotion}, @用户={reply_plan.target_user_id}, 需要@={reply_plan.should_mention}"
+                    logger.info(msg, extra={
+                        "group_id": group_id,
+                        "reply_index": idx,
+                        "reply_type": reply_plan.reply_type,
+                        "emotion": reply_plan.emotion,
+                        "target_user_id": reply_plan.target_user_id,
+                        "should_mention": reply_plan.should_mention,
+                    })
+                    print(msg)
+                    msg = f"[block_judge]   指导词: {reply_plan.instruction}"
+                    logger.info(msg, extra={"group_id": group_id})
+                    print(msg)
+                    msg = f"[block_judge]   针对内容: {reply_plan.related_messages}"
+                    logger.info(msg, extra={"group_id": group_id})
+                    print(msg)
+
+            # 处理沉默模式转换
+            if group_id:
+                if result.user_complaining_too_much:
+                    set_silent(group_id, True)
+                    logger.warning(
+                        f"[block_judge] ⚠️ 进入沉默模式: 用户抱怨说话太多",
+                        extra={"group_id": group_id},
+                    )
+                elif result.user_asking_to_speak:
+                    set_silent(group_id, False)
+                    logger.info(
+                        f"[block_judge] ℹ️ 退出沉默模式: 用户催促说话",
+                        extra={"group_id": group_id},
+                    )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"[block_judge] 判断出错: {e}", exc_info=True)
+            return BlockJudgeResult.no_reply(f"判断出错: {e}")
+
+
+# 全局单例
+block_judger = BlockJudger()

@@ -45,20 +45,11 @@ class ResponseBlock:
     is_processing: bool = False
     wait_task: asyncio.Task | None = None
     judge_wait_task: asyncio.Task | None = None  # 用于判断等待时间的API任务
-    expected_wait_time: float = 2.0  # 预期的等待时间（秒）
-    wait_judgment_done: bool = False  # 等待时间判断是否完成
 
     def add_message(self, msg: PendingMessage) -> None:
         """添加消息到块中"""
         self.messages.append(msg)
         self.last_message_at = time.time()
-
-    def get_all_content(self) -> str:
-        """获取块中所有消息的内容（用于上下文）"""
-        lines = []
-        for msg in self.messages:
-            lines.append(f"[{msg.user_id}]: {msg.message_content}")
-        return "\n".join(lines)
 
     def get_message_count(self) -> int:
         """获取消息数量"""
@@ -78,8 +69,6 @@ class ResponseBlock:
         self.created_at = time.time()
         self.last_message_at = time.time()
         self.is_processing = False
-        self.expected_wait_time = 2.0
-        self.wait_judgment_done = False
         if self.wait_task and not self.wait_task.done():
             self.wait_task.cancel()
         self.wait_task = None
@@ -212,10 +201,6 @@ class MessageAggregator:
                     logger.info(msg, extra={"group_id": group_id, "wait_seconds": wait_time, "should_wait": True})
                     print(msg)
 
-                    # 保存等待时间并启动实际等待
-                    block.expected_wait_time = wait_time
-                    block.wait_judgment_done = True
-
                     # 启动实际的等待任务
                     block.wait_task = asyncio.create_task(
                         self._wait_and_process(group_id, wait_time)
@@ -226,9 +211,6 @@ class MessageAggregator:
                     logger.info(msg, extra={"group_id": group_id, "should_wait": False})
                     print(msg)
 
-                    block.expected_wait_time = 0.0
-                    block.wait_judgment_done = True
-
                     # 立即启动处理（0秒等待）
                     block.wait_task = asyncio.create_task(
                         self._wait_and_process(group_id, 0.0)
@@ -238,8 +220,6 @@ class MessageAggregator:
                 msg = f"[aggregator] ⚠️ JSON解析失败，使用默认等待5秒"
                 logger.warning(msg, extra={"group_id": group_id})
                 print(msg)
-                block.expected_wait_time = 5.0
-                block.wait_judgment_done = True
                 block.wait_task = asyncio.create_task(
                     self._wait_and_process(group_id, 5.0)
                 )
@@ -252,8 +232,6 @@ class MessageAggregator:
         except Exception as e:
             logger.warning(f"[aggregator] 判断等待时间失败: {e}, 使用默认2秒", extra={"group_id": group_id})
             print(f"[aggregator] ⚠️ 判断等待时间失败: {e}, 使用默认2秒")
-            block.expected_wait_time = 2.0
-            block.wait_judgment_done = True
             block.wait_task = asyncio.create_task(
                 self._wait_and_process(group_id, 2.0)
             )
@@ -265,7 +243,6 @@ class MessageAggregator:
         message_content: str,
         event: Any,
         is_bot_mentioned: bool = False,
-        wait_seconds: float = 2.0,
     ) -> None:
         """添加消息到聚合块
 
@@ -279,7 +256,6 @@ class MessageAggregator:
             message_content: 消息内容
             event: 原始事件对象
             is_bot_mentioned: 是否@了机器人
-            wait_seconds: 基础等待时间（秒）
         """
         lock = self._get_lock(group_id)
 
@@ -347,9 +323,6 @@ class MessageAggregator:
                     await block.judge_wait_task
                 except asyncio.CancelledError:
                     pass
-                # 重置判断状态
-                block.wait_judgment_done = False
-
             # 启动新的等待时间判断API调用
             block.judge_wait_task = asyncio.create_task(
                 self._judge_wait_time(group_id, block)
@@ -381,6 +354,7 @@ class MessageAggregator:
 
                 # 标记为处理中
                 block.is_processing = True
+                processing_block = block
 
                 msg = f"[aggregator] ⏰ 等待时间已到，对话块已关闭 | 群={group_id}, 块内消息数={block.get_message_count()}, 用户数={len(block.get_unique_users())}, @机器人={block.has_bot_mention()}"
                 logger.info(msg, extra={
@@ -397,7 +371,7 @@ class MessageAggregator:
                     msg = f"[aggregator] 🔷 触发回复处理回调 | 群={group_id}"
                     logger.debug(msg, extra={"group_id": group_id})
                     print(msg)
-                    await self._reply_callback(group_id, block)
+                    await self._reply_callback(group_id, processing_block)
                 except Exception as e:
                     logger.error(
                         f"[aggregator] Reply callback failed for group {group_id}: {e}",
@@ -406,10 +380,17 @@ class MessageAggregator:
 
             # 处理完成后清空块
             async with lock:
-                msg = f"[aggregator] 🧹 对话块已处理完毕，清空块 | 群={group_id}"
-                logger.info(msg, extra={"group_id": group_id})
-                print(msg)
-                block.clear()
+                current_block = self._blocks.get(group_id)
+                if current_block is processing_block:
+                    msg = f"[aggregator] 🧹 对话块已处理完毕，清空块 | 群={group_id}"
+                    logger.info(msg, extra={"group_id": group_id})
+                    print(msg)
+                else:
+                    logger.debug(
+                        "[aggregator] New block exists; cleaning processed block only",
+                        extra={"group_id": group_id},
+                    )
+                processing_block.clear()
 
         except asyncio.CancelledError:
             # 任务被取消（因为有新消息），这是正常的

@@ -207,7 +207,9 @@ class BlockJudger:
         for msg in block.messages:
             user_name = user_names.get(msg.user_id, f"用户{msg.user_id}")
             mention_tag = " 【@小奏】" if msg.is_bot_mentioned else ""
-            lines.append(f"{user_name}({msg.user_id}){mention_tag}: {msg.message_content}")
+            lines.append(
+                f"{msg.user_id}(显示名:{user_name}){mention_tag}: {msg.message_content}"
+            )
 
         return "\n".join(lines)
 

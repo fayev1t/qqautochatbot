@@ -12,9 +12,9 @@ Execution order (lower priority runs first):
 
 The aggregation mechanism:
 - Messages are collected into a "response block" per group
-- After receiving a message, wait 2 seconds for more messages
+- After receiving a message, ask the wait-time judge how long to wait
 - If new messages arrive, reset the timer and add to block
-- When timer expires, analyze the entire block and respond
+- When the wait expires, analyze the entire block and respond
 """
 
 import asyncio
@@ -29,12 +29,8 @@ from qqbot.services.conversation import ConversationService
 from qqbot.services.group_message import GroupMessageService
 from qqbot.services.group_member import GroupMemberService
 from qqbot.services.user import UserService
-from qqbot.services.message_aggregator import (
-    MessageAggregator,
-    ResponseBlock,
-    message_aggregator,
-)
-from qqbot.services.block_judge import block_judger, ReplyPlan, JudgeResult
+from qqbot.services.message_aggregator import ResponseBlock, message_aggregator
+from qqbot.services.block_judge import block_judger, JudgeResult
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +39,6 @@ group_chat_handler = on_message(priority=50, block=False)
 
 # Store bot instance for callback use
 _bot_instance: Bot | None = None
-
-# Default wait time in seconds
-DEFAULT_WAIT_SECONDS = 2.0
 
 
 async def _process_response_block(group_id: int, block: ResponseBlock) -> None:
@@ -299,8 +292,7 @@ async def handle_group_chat(bot: Bot, event: GroupMessageEvent) -> None:
         logger.debug(f"Skipping empty message in group {group_id}")
         return
 
-    # Add message to aggregation block
-    # The block will be processed after DEFAULT_WAIT_SECONDS of inactivity
+    # Add message to aggregation block (等待时间由聚合器判断)
     try:
         logger.debug(
             f"[group_chat] 💬 处理消息 | 群={group_id}, 用户={user_id}, "
@@ -319,7 +311,6 @@ async def handle_group_chat(bot: Bot, event: GroupMessageEvent) -> None:
             message_content=message_content,
             event=event,
             is_bot_mentioned=is_bot_mentioned,
-            wait_seconds=DEFAULT_WAIT_SECONDS,
         )
 
     except Exception as e:

@@ -9,7 +9,7 @@ external.message.group.*，有两道闸——
    v2_main 的四个 matcher 都不会接到它；
 ② 本 mapper 的 can_map 也只认 post_type=="message"。
 因此 bot 的发言在事件流里只有一种形态：send_messages 工具的
-agent.tool_called/tool_result 对（projection 渲染成 `<工具>send_messages`
+agent.tool_called/tool_result 对（projection 渲染成 `<tool>send_messages`
 行块，那一行块本身就是时间线上的发言记录；author 索引据其
 逐条回执里的 message_id+self_id 折出 reply 段的 from_self="true"。已删除的
 旧链路 send_message / runtime.reply_flushed 只在历史兼容渲染路径里还认，
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from qqbot.core.ids import new_msg_hash
 from qqbot.services.event_ingest import idempotency
 from qqbot.services.event_ingest.napcat_helpers import (
     dump_event,
@@ -58,7 +57,6 @@ class GroupMessageMapper:
         type_name = _SUBTYPE_TO_TYPE.get(msg_sub_type, "external.message.group.normal")
 
         payload = {
-            "msg_hash": new_msg_hash(),
             "onebot_message_id": str(getattr(event, "message_id", "")),
             "raw_message": getattr(event, "raw_message", "") or "",
             "sender": _dump_sender(event),

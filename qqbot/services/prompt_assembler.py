@@ -21,6 +21,8 @@ def assemble(
     scope: str | None = None,
     tool_registry: object | None = None,
 ) -> str:
+    if scene not in CONSUMERS:
+        raise KeyError(f"unregistered prompt scene: {scene!r}")
     return render_system_prompt(
         scene, scope=scope, tool_registry=tool_registry
     )

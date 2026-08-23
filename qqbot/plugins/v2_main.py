@@ -27,7 +27,6 @@ from nonebot import get_driver, on_message, on_metaevent, on_notice, on_request
 from nonebot.adapters import Bot, Event
 
 from qqbot.core.database import AsyncSessionLocal
-from qqbot.core.llm import set_model_outcome_sink
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop import (
     LLMPlanner,
@@ -39,6 +38,10 @@ from qqbot.services.agent_loop.bot_role_sweep import (
     reflect_bot_role_from_meta,
     reflect_bot_role_from_notice,
 )
+from qqbot.services.agent_loop.daily_background import (
+    register_daily_background_job,
+    schedule_catch_up_from_meta,
+)
 from qqbot.services.agent_loop.image_description import (
     describe_image,
     describe_images,
@@ -47,10 +50,7 @@ from qqbot.services.agent_loop.meme_caption import caption_image
 from qqbot.services.agent_loop.tools import (
     build_default_registry as build_tool_registry,
 )
-from qqbot.services.event_gateway.outbound import (
-    schedule_model_outcome,
-    set_inbound_gateway,
-)
+from qqbot.services.event_gateway.outbound import set_inbound_gateway
 from qqbot.services.event_gateway.silence_gate import apply_silence_gate
 from qqbot.services.event_ingest import EventIngest, IngestResult, SystemEvent
 from qqbot.services.event_ingest.mappers import build_default_registry
@@ -118,6 +118,7 @@ async def _notify_committed_event(event: SystemEvent) -> None:
 def _get_ingest() -> EventIngest:
     global _ingest
     if _ingest is None:
+        sup = _get_supervisor()
         _ingest = EventIngest(
             registry=build_default_registry(),
             session_factory=AsyncSessionLocal,
@@ -128,9 +129,9 @@ def _get_ingest() -> EventIngest:
             image_describer=_describe_image,
             batch_image_describer=_describe_images,
             registration_window_seconds=1.0,
+            tool_registry=sup._tool_registry,
         )
         set_inbound_gateway(_ingest.gateway)
-        set_model_outcome_sink(schedule_model_outcome)
     return _ingest
 
 
@@ -212,11 +213,11 @@ async def _on_request(bot: Bot, event: Event) -> None:
 async def _on_meta(bot: Bot, event: Event) -> None:
     _remember_bot(bot)
     result = await _ingest_event(event)
-    reflect_bot_role_from_meta(
-        bot,
-        _newly_committed_event(result),
-        AsyncSessionLocal,
-    )
+    committed = _newly_committed_event(result)
+    reflect_bot_role_from_meta(bot, committed, AsyncSessionLocal)
+    # lifecycle.connect 补写今天的每日背景：调度器只在 00:00 触发，进程那会儿
+    # 关着就整天一条都没有。判据是"本群今天已有一条就跳过"，重连不会写重。
+    schedule_catch_up_from_meta(bot, committed, AsyncSessionLocal)
 
 
 _driver = get_driver()
@@ -225,11 +226,18 @@ _driver = get_driver()
 @_driver.on_startup
 async def _start_v2_loop() -> None:
     """init_db 之后启动 LoopSupervisor。startup.py 的 on_startup 注册在前，
-    所以这条 hook 跑时 DB 已经就绪。"""
+    所以这条 hook 跑时 DB 与 scheduler 都已就绪。"""
     try:
         await _get_supervisor().start()
     except Exception as exc:
         logger.exception("[v2_main] supervisor.start failed: {}", exc)
+    # 每日背景挂在这里而不是 startup.py：那边只管 DB 与调度器本身，不认识
+    # napcat；本 plugin 才是 v2 的唯一入站路径。此刻还没有 bot 连上来也不要紧
+    # ——job 在触发时才去 bot_registry 取。
+    try:
+        register_daily_background_job(AsyncSessionLocal)
+    except Exception as exc:
+        logger.exception("[v2_main] daily background job register failed: {}", exc)
 
 
 @_driver.on_shutdown

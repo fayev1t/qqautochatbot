@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from qqbot.core.ids import new_msg_hash
 from qqbot.services.event_ingest import idempotency
 from qqbot.services.event_ingest.napcat_helpers import (
     dump_event,
@@ -33,7 +32,6 @@ class PrivateMessageMapper:
 
     def map(self, event: Any) -> PartialSystemEvent:
         payload = {
-            "msg_hash": new_msg_hash(),
             "onebot_message_id": str(getattr(event, "message_id", "")),
             "raw_message": getattr(event, "raw_message", "") or "",
             "sender": _dump_private_sender(event),

@@ -7,6 +7,7 @@ from typing import Any
 _LAZY: dict[str, str] = {
     "AdaptedEvent": "registry",
     "EventRegistrar": "registry",
+    "issue_event_id": "registry",
     "InboundGateway": "inbound",
     "SilenceGateDecision": "silence_gate",
     "UpstreamEnvelope": "inbound",
@@ -17,6 +18,8 @@ _LAZY: dict[str, str] = {
     "set_inbound_gateway": "outbound",
     "submit_model_outcome": "outbound",
     "submit_tool_outcome": "outbound",
+    "invoke": "outbound",
+    "InvokeResult": "outbound",
 }
 
 __all__ = list(_LAZY)

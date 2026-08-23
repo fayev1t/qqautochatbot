@@ -1,7 +1,7 @@
 """统一上游入口网关。
 
 盖本地 occurred_at（不用 NapCat 自带时间），把原文写入 raw 表，插入成功后
-交给注册器。身份哈希不在这里发。
+交给注册器。event_id 不在这里发。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ class UpstreamEnvelope:
     payload: dict[str, Any]
     source: Any
     future: asyncio.Future[Any] = field(repr=False)
+    notify: bool | None = None
 
 
 class InboundGateway:
@@ -42,17 +43,20 @@ class InboundGateway:
         payload: dict[str, Any],
         *,
         source: Any = None,
+        occurred_at: datetime | None = None,
+        notify: bool | None = None,
     ) -> Any:
-        occurred_at = china_now()
+        stamped = occurred_at if occurred_at is not None else china_now()
         seq = self._registrar.allocate_seq()
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         envelope = UpstreamEnvelope(
             channel=str(channel or "").strip() or "other",
-            occurred_at=occurred_at,
+            occurred_at=stamped,
             seq=seq,
             payload=payload if isinstance(payload, dict) else {},
             source=source,
             future=future,
+            notify=notify,
         )
         inserted = await insert_raw_event(
             self._session_factory,

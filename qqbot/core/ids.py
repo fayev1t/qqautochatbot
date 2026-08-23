@@ -3,29 +3,27 @@ from __future__ import annotations
 import os
 import threading
 import time
-from uuid import uuid4
 
 _CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _RANDOM_MASK = (1 << 80) - 1
 _TIME_MASK = (1 << 48) - 1
 
-# 同进程内单调：同一毫秒（或时钟回拨）连续生成的 id 严格递增，
-# 让 EventIngest 在任何 await 之前盖的章按 handler 启动次序排序，
-# 而不是按媒体/VLM 完成次序。跨进程不协调。
+# 同进程内单调：同一毫秒（或时钟回拨）连续生成的 id 严格递增。
+# agent_events.event_id 只经注册层 issue_event_id() 发放；本函数是 ULID 原语，
+# 也给 correlation_id / tool_call_id / task_id / raw_id 等非事件身份用。
+# 跨进程不协调。
 _lock = threading.Lock()
 _last_timestamp_ms = -1
 _last_randomness = 0
 
 
-def new_msg_hash() -> str:
-    return uuid4().hex
-
-
 def new_event_id() -> str:
-    """生成一枚 ULID 风格的事件 id（26 字符 Crockford base32）。
+    """生成一枚 ULID 风格的 id（26 字符 Crockford base32）。
 
     时间分量 48 bit（毫秒）+ 随机分量 80 bit。同一进程、同一毫秒内单调递增。
-    用作 agent_events.event_id 主键，详见 开发文档/v2.0/事件系统设计.md §2、§3。
+    ``agent_events.event_id`` 必须经 ``event_gateway.registry.issue_event_id``
+    发放，不要在 Mapper / finalize 里直接调用。详见
+    开发文档/v2.0/事件系统设计.md §2、§3。
     """
     global _last_timestamp_ms, _last_randomness
     timestamp_ms = int(time.time() * 1000) & _TIME_MASK

@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from qqbot.core.ids import new_event_id
-
 Origin = Literal["external", "agent", "runtime"]
 Scope = Literal["system", "group", "private"]
 Visibility = Literal["agent_visible", "runtime_only"]
@@ -18,7 +16,13 @@ Visibility = Literal["agent_visible", "runtime_only"]
 
 @dataclass(frozen=True)
 class PartialSystemEvent:
-    """Pre-finalization ingest event without ids, timestamps, or causality."""
+    """Pre-finalization ingest event without timestamps.
+
+    ``event_id`` 缺省由注册层发放。``begin_effect_call`` 必须先把 id 注入
+    工具 context，因而可预填——预填值仍须来自注册层发放口。
+    外部入站的 ``correlation_id`` 在 finalize 时等于本枚 event_id；内部
+    通道可把 tick 的 correlation / 直接前因带进来。
+    """
 
     origin: Origin
     type: str
@@ -29,6 +33,9 @@ class PartialSystemEvent:
     payload: dict
     raw: dict | None
     idempotency_key: str | None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    event_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,20 +61,22 @@ def finalize(
     partial: PartialSystemEvent,
     *,
     occurred_at: datetime,
-    event_id: str | None = None,
+    event_id: str,
 ) -> SystemEvent:
-    """Stamp a PartialSystemEvent with event_id and self-correlation.
+    """把 PartialSystemEvent 定格为可落库的 SystemEvent。
 
-    ``event_id`` is used as-is when the caller minted it at arrival; omitted
-    means mint here. EventIngest stamps before any await so success and
-    failure terminals share that id — media/VLM duration must not reorder
-    same-second facts in the projection.
+    ``event_id`` 必须由注册层发放（或等于 partial 上预领的那枚），这里不 mint。
+    外部入站自相关：``correlation_id`` 缺省等于这枚 ``event_id``。内部通道
+    若在 partial 上带了 tick 的 correlation / causation，原样保留。
+    见 事件系统设计.md §2、§6。
 
-    Ingest terminal events are self-correlated: their correlation_id equals
-    their own event_id, so any tick the loop runs in response can reuse it.
-    See 事件系统设计.md §6.
+    业务内容指纹（``payload`` 里的 ``file_hash`` / ``program_sha256``，以及
+    ``idempotency_key``）原样带过，本函数不改写。
     """
-    eid = event_id or new_event_id()
+    eid = str(partial.event_id or event_id)
+    if not eid:
+        raise ValueError("finalize requires event_id issued by EventRegistrar")
+    correlation = partial.correlation_id or eid
     return SystemEvent(
         event_id=eid,
         occurred_at=occurred_at,
@@ -77,8 +86,8 @@ def finalize(
         group_id=partial.group_id,
         user_id=partial.user_id,
         visibility=partial.visibility,
-        correlation_id=eid,
-        causation_id=None,
+        correlation_id=correlation,
+        causation_id=partial.causation_id,
         idempotency_key=partial.idempotency_key,
         payload=partial.payload,
         raw=partial.raw,

@@ -32,10 +32,7 @@ from typing import Any
 from unittest import mock
 
 from qqbot.core.time import china_now
-from qqbot.services.agent_loop.decision import (
-    DecisionContext,
-    ProgramValidationFeedback,
-)
+from qqbot.services.agent_loop.decision import DecisionContext
 from qqbot.services.agent_loop.llm_planner import LLMPlanner
 from qqbot.services.agent_loop.prompt_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -141,7 +138,7 @@ class SchemaTests(_SnapshotEnvTestCase):
         self.assertEqual(data["correlation_id"], "CID-1")
         self.assertEqual(data["model"], "gpt-test")
         self.assertEqual(data["outcome"], "parsed")
-        self.assertFalse(data["validation_retry"])
+        self.assertNotIn("validation_retry", data)
         # 正文 + 与正文一致的体积/哈希
         self.assertEqual(data["system_prompt"], "SYSTEM BODY")
         self.assertEqual(data["system_prompt_chars"], len("SYSTEM BODY"))
@@ -411,23 +408,18 @@ class PlannerSnapshotIntegrationTests(_SnapshotEnvTestCase):
         asyncio.run(planner.decide(_ctx(scope_key="private:55")))
         self.assertEqual(self.files(), [])
 
-    def test_validation_retry_flag_recorded(self) -> None:
-        from dataclasses import replace
+    def test_one_tick_writes_exactly_one_attempt(self) -> None:
+        """一个响应绑定一次模型执行（2026-08-21 §一⑦）：快照与拍一一对应。
 
+        同拍三次静态重试撤销后，同一 ``tick_seq`` 下不再出现多份 planner 快照，
+        ``validation_retry`` 这个标志位也随之删除。
+        """
         llm = _StubLLM(response_content="# idle")
         planner = LLMPlanner(llm_client=llm)
-        ctx = replace(
-            _ctx(),
-            validation_feedback=ProgramValidationFeedback(
-                attempt=1,
-                error_kind="program_syntax_error",
-                message="x",
-                rejected_program="bad",
-            ),
-        )
-        asyncio.run(planner.decide(ctx))
+        asyncio.run(planner.decide(_ctx()))
         data = self.read_single()
-        self.assertTrue(data["validation_retry"])
+        self.assertEqual(len(data["attempts"]), 1)
+        self.assertNotIn("validation_retry", data)
 
 
 class MemeCaptionSnapshotIntegrationTests(_SnapshotEnvTestCase):
@@ -442,7 +434,7 @@ class MemeCaptionSnapshotIntegrationTests(_SnapshotEnvTestCase):
             return llm
 
         with mock.patch(
-            "qqbot.services.agent_loop.meme_caption.create_llm",
+            "qqbot.services.event_gateway.outbound.create_llm",
             fake_create_llm,
         ):
             text = asyncio.run(
@@ -478,7 +470,7 @@ class MemeCaptionSnapshotIntegrationTests(_SnapshotEnvTestCase):
             return llm
 
         with mock.patch(
-            "qqbot.services.agent_loop.meme_caption.create_llm",
+            "qqbot.services.event_gateway.outbound.create_llm",
             fake_create_llm,
         ):
             with self.assertRaises(CaptionError):

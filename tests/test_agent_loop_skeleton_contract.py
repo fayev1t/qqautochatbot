@@ -168,7 +168,7 @@ class _SelectResult:
 
 
 class _DecisionLookupSession(_RecordingSession):
-    """Recording session that can answer ``load_referenced_decision`` SELECTs.
+    """Recording session that can answer ``load_program_asset`` SELECTs.
 
     Other SELECTs (recovery, projection, task backfill) stay empty so idle-tick
     tests keep seeing a blank world.
@@ -265,7 +265,7 @@ class _ProposeThenCommitPlanner:
                 await asyncio.sleep(self._delay_commit)
             event_id = decisions[0].get("event_id")
             return DecisionOutput(
-                program=f'execute_decision(event_id="{event_id}")'
+                program=f'execute_program(program_hash="{event_id}")'
             )
         return DecisionOutput(program="# nothing left to do")
 
@@ -764,9 +764,10 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
         )
         await sup.start()
         await sup.stop()
-        # start() 期间任务读模型回填（task_store.backfill_recent）本身就会
-        # 发一条 SELECT——本用例的断言对象是"stop 后 wake 不再产生任何新
-        # 语句"，故取 stop 后的基线数比对，而非要求 captured 全程为空。
+        # 断言对象是"stop 后 wake 不再产生任何新语句"，故取 stop 后的基线数
+        # 比对，而不要求 captured 全程为空——start() 期间可能有别的启动查询。
+        # （2026-08-21 前这里的启动查询是 task_store.backfill_recent，已随
+        # agent_tasks 读模型一并删除。）
         baseline = len(captured)
         await sup.wake("group:1")
         await asyncio.sleep(0.02)
@@ -1092,7 +1093,7 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
     """自续拍：提案拍 / 裁决报错拍 / Runner terminal 都再开一拍；空程序是不动点。
 
     提案拍自己就会自唤醒，不代表程序跑过。要证明副作用发生，必须再看一拍
-    ``execute_decision`` 之后有没有 ``tool_called``。
+    ``execute_program`` 之后有没有 ``tool_called``。
     """
 
     @staticmethod
@@ -1170,7 +1171,7 @@ class ContinuationTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ended[0]["payload"]["left_proposal"])
 
     async def test_commit_runs_named_program_then_terminal_wakes(self) -> None:
-        """后一拍 execute_decision 才入队；terminal 再叫醒空程序收尾。"""
+        """后一拍 execute_program 才入队；terminal 再叫醒空程序收尾。"""
         registry = ToolRegistry()
         registry.register(_TimestampEffect)
         captured: list[Any] = []

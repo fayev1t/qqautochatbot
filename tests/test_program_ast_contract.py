@@ -237,16 +237,26 @@ class ProgramWhitelistContractTests(unittest.TestCase):
 
     def test_former_query_accepts_system_reserved_arguments(self) -> None:
         prepared = preflight(
-            'members(task_id="T1")',
+            'members(triggered_by_event_id="E1")',
             self.registry,
             "group",
         )
         self.assertEqual(prepared.call_sites[0].name, "members")
 
+    def test_task_id_is_no_longer_a_reserved_argument(self) -> None:
+        """2026-08-21：任务坍缩为单栏便签，task_id 值域消失（§一②）。
+
+        它现在只是个普通未知具名参数，静态层当场拒掉——而不是被执行层默默
+        当成挂靠锚吞掉。同时抽掉的还有敏感工具权限反查的回退路径，见
+        planner.md：triggered_by_event_id 必须显式传。
+        """
+        info = self._error('notify(message="x", task_id="T1")')
+        self.assertEqual(info.details["construct"], "unknown_keyword")
+
     def test_effect_reserved_arguments_must_be_string_or_null(self) -> None:
         for source in (
-            'notify(message="x", task_id=123)',
             'notify(message="x", triggered_by_event_id=True)',
+            'notify(message="x", triggered_by_event_id=123)',
         ):
             with self.subTest(source=source):
                 info = self._error(source)
@@ -340,7 +350,7 @@ class ExecuteDecisionContractTests(unittest.TestCase):
     写死的事件 ID。
     """
 
-    EVENT_ID = "01K2X9F3MQ8B4NVYRTC7HDZ6EW"
+    PROGRAM_HASH = "8f3c4e5a6b7c"
 
     def setUp(self) -> None:
         self.registry = _registry()
@@ -350,20 +360,22 @@ class ExecuteDecisionContractTests(unittest.TestCase):
             preflight(source, self.registry, scope)
         return caught.exception.info
 
-    def test_bare_commit_statement_yields_commit_event_id(self) -> None:
+    def test_bare_commit_statement_yields_commit_program_hash(self) -> None:
         prepared = preflight(
-            f'execute_decision(event_id="{self.EVENT_ID}")', self.registry, "group"
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")',
+            self.registry,
+            "group",
         )
-        self.assertEqual(prepared.commit_event_id, self.EVENT_ID)
+        self.assertEqual(prepared.commit_program_hash, self.PROGRAM_HASH)
         # 它自己不是调用点：裁决拍没有任何工具被调用。
         self.assertEqual(prepared.call_sites, ())
         self.assertFalse(prepared.has_return)
 
-    def test_ordinary_program_has_no_commit_event_id(self) -> None:
+    def test_ordinary_program_has_no_commit_program_hash(self) -> None:
         prepared = preflight(
             'notify(message="hi")', self.registry, "group"
         )
-        self.assertIsNone(prepared.commit_event_id)
+        self.assertIsNone(prepared.commit_program_hash)
         self.assertEqual(len(prepared.call_sites), 1)
 
     def test_a_commit_and_new_code_coexist_in_one_response(self) -> None:
@@ -374,20 +386,20 @@ class ExecuteDecisionContractTests(unittest.TestCase):
         每拍都该两层都写：确认上一段、同时写下一段，多出来的那次推理才被摊掉。
         """
         prepared = preflight(
-            f'execute_decision(event_id="{self.EVENT_ID}")\n'
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")\n'
             'notify(message="hi")',
             self.registry,
             "group",
         )
-        self.assertEqual(prepared.commit_event_id, self.EVENT_ID)
+        self.assertEqual(prepared.commit_program_hash, self.PROGRAM_HASH)
         self.assertEqual([site.name for site in prepared.call_sites], ["notify"])
 
         with_return = preflight(
-            f'execute_decision(event_id="{self.EVENT_ID}")\nreturn 1',
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")\nreturn 1',
             self.registry,
             "group",
         )
-        self.assertEqual(with_return.commit_event_id, self.EVENT_ID)
+        self.assertEqual(with_return.commit_program_hash, self.PROGRAM_HASH)
         self.assertTrue(with_return.has_return)
 
     def test_the_directive_is_stripped_before_storage(self) -> None:
@@ -397,7 +409,7 @@ class ExecuteDecisionContractTests(unittest.TestCase):
         连带再调度一次，形成套娃。
         """
         prepared = preflight(
-            f'execute_decision(event_id="{self.EVENT_ID}")\n'
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")\n'
             'notify(message="hi")',
             self.registry,
             "group",
@@ -408,11 +420,11 @@ class ExecuteDecisionContractTests(unittest.TestCase):
             hashlib.sha256(prepared.source.encode("utf-8")).hexdigest(),
         )
         self.assertNotIn(
-            "execute_decision", ast.unparse(build_executable_tree(prepared))
+            "execute_program", ast.unparse(build_executable_tree(prepared))
         )
         # 落库的源码再走一遍 preflight（裁决时就是这么做的）必须干净。
         again = preflight(prepared.source, self.registry, "group")
-        self.assertIsNone(again.commit_event_id)
+        self.assertIsNone(again.commit_program_hash)
         self.assertEqual(
             [site.name for site in again.call_sites],
             [site.name for site in prepared.call_sites],
@@ -421,7 +433,9 @@ class ExecuteDecisionContractTests(unittest.TestCase):
     def test_a_pure_directive_leaves_an_empty_body(self) -> None:
         """③ 纯裁决：剥完只剩空串，动作层为空，日后不可被指名。"""
         prepared = preflight(
-            f'execute_decision(event_id="{self.EVENT_ID}")', self.registry, "group"
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")',
+            self.registry,
+            "group",
         )
         self.assertEqual(prepared.source, "")
         self.assertEqual(prepared.call_sites, ())
@@ -429,26 +443,36 @@ class ExecuteDecisionContractTests(unittest.TestCase):
 
     def test_a_multiline_directive_is_stripped_whole(self) -> None:
         prepared = preflight(
-            f'execute_decision(\n    event_id="{self.EVENT_ID}",\n)\n'
+            f'execute_program(\n    program_hash="{self.PROGRAM_HASH}",\n)\n'
             'notify(message="hi")',
             self.registry,
             "group",
         )
-        self.assertEqual(prepared.commit_event_id, self.EVENT_ID)
+        self.assertEqual(prepared.commit_program_hash, self.PROGRAM_HASH)
         self.assertEqual(prepared.source, 'notify(message="hi")')
 
-    def test_event_id_must_be_a_literal_26_char_id(self) -> None:
+    def test_program_hash_must_be_a_literal_12_hex(self) -> None:
         cases = {
-            'execute_decision(event_id="not-an-id")': "commit_event_id_malformed",
-            # 小写 / 含 base32 排除字符（I L O U）都不是合法事件 ID。
-            'execute_decision(event_id="01k2x9f3mq8b4nvyrtc7hdz6ew")': (
-                "commit_event_id_malformed"
+            'execute_program(program_hash="not-a-hash")': (
+                "commit_program_hash_malformed"
             ),
-            'execute_decision(event_id="01K2X9F3MQ8B4NVYRTC7HDZ6EI")': (
-                "commit_event_id_malformed"
+            # 大写十六进制不是合法 hash（展示前缀恒为小写）。
+            'execute_program(program_hash="8F3C4E5A6B7C")': (
+                "commit_program_hash_malformed"
             ),
-            f'e = "{self.EVENT_ID}"\nexecute_decision(event_id=e)': (
-                "commit_event_id_not_literal"
+            # 长度必须恰好 12：短一位、长一位都不行。
+            'execute_program(program_hash="8f3c4e5a6b7")': (
+                "commit_program_hash_malformed"
+            ),
+            'execute_program(program_hash="8f3c4e5a6b7cd")': (
+                "commit_program_hash_malformed"
+            ),
+            # 26 位事件 ID 属于另一个值域，不能拿来当代码资产 hash。
+            'execute_program(program_hash="01K2X9F3MQ8B4NVYRTC7HDZ6EW")': (
+                "commit_program_hash_malformed"
+            ),
+            f'e = "{self.PROGRAM_HASH}"\nexecute_program(program_hash=e)': (
+                "commit_program_hash_not_literal"
             ),
         }
         for source, construct in cases.items():
@@ -459,34 +483,34 @@ class ExecuteDecisionContractTests(unittest.TestCase):
 
     def test_commit_must_be_a_top_level_statement(self) -> None:
         nested = self._error(
-            f'if 1 == 1:\n    execute_decision(event_id="{self.EVENT_ID}")'
+            f'if 1 == 1:\n    execute_program(program_hash="{self.PROGRAM_HASH}")'
         )
         self.assertEqual(nested.details["construct"], "commit_not_top_level")
         assigned = self._error(
-            f'x = execute_decision(event_id="{self.EVENT_ID}")'
+            f'x = execute_program(program_hash="{self.PROGRAM_HASH}")'
         )
         self.assertEqual(assigned.details["construct"], "commit_not_a_statement")
 
     def test_signature_is_exactly_one_named_event_id(self) -> None:
-        positional = self._error(f'execute_decision("{self.EVENT_ID}")')
+        positional = self._error(f'execute_program("{self.PROGRAM_HASH}")')
         self.assertEqual(
             positional.details["construct"], "program_function_positional_args"
         )
         extra = self._error(
-            f'execute_decision(event_id="{self.EVENT_ID}", extra=1)'
+            f'execute_program(program_hash="{self.PROGRAM_HASH}", extra=1)'
         )
         self.assertEqual(extra.details["construct"], "commit_signature")
 
     def test_one_commit_per_program(self) -> None:
         info = self._error(
-            f'execute_decision(event_id="{self.EVENT_ID}")\n'
-            f'execute_decision(event_id="{self.EVENT_ID}")'
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")\n'
+            f'execute_program(program_hash="{self.PROGRAM_HASH}")'
         )
         self.assertEqual(info.error_kind, "program_quota_exceeded")
         self.assertEqual(info.details["max"], 1)
 
     def test_the_name_cannot_be_shadowed(self) -> None:
-        info = self._error("execute_decision = 1")
+        info = self._error("execute_program = 1")
         self.assertEqual(info.details["construct"], "reserved_assignment_name")
 
 

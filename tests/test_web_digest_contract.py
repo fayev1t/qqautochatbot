@@ -48,8 +48,9 @@ class _FakeLLM:
 def _patched(llm: _FakeLLM | None):
     """create_llm → 固定 fake；快照关掉（环境无关、零盘写）。"""
     return (
-        mock.patch.object(
-            web_digest, "create_llm", mock.AsyncMock(return_value=llm)
+        mock.patch(
+            "qqbot.services.event_gateway.outbound.create_llm",
+            mock.AsyncMock(return_value=llm),
         ),
         mock.patch.object(web_digest, "should_snapshot", lambda scope: False),
     )
@@ -110,7 +111,9 @@ class WebDigestFailureTests(unittest.TestCase):
 
     def test_empty_text_short_circuits_without_llm(self) -> None:
         create = mock.AsyncMock()
-        with mock.patch.object(web_digest, "create_llm", create):
+        with mock.patch(
+            "qqbot.services.event_gateway.outbound.create_llm", create
+        ):
             self.assertIsNone(
                 asyncio.run(digest_page_text("   ", url="https://x/"))
             )
@@ -138,7 +141,9 @@ class DigestOrTruncateTests(unittest.TestCase):
 
     def test_empty_text_passthrough(self) -> None:
         create = mock.AsyncMock()
-        with mock.patch.object(web_digest, "create_llm", create):
+        with mock.patch(
+            "qqbot.services.event_gateway.outbound.create_llm", create
+        ):
             self.assertEqual(
                 asyncio.run(digest_or_truncate("", url="https://x/")), ""
             )

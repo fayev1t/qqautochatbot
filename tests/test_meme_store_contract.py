@@ -9,14 +9,14 @@ Covers（表情包工具黑盒设计.md §存储；2026-07-06 起全局共享）
 - get_meme：按 hash 单条精确查 → MemeView（含 context_note 留档回读，供
   meme.recaption 沿用旧语境）；未命中 → None。
 - load_saved_memes：created_at 倒序 + LIMIT（语句面断言）；UTC 时间
-  normalize 到北京时间（与 task_store 同约定）。
+  normalize 到北京时间。
 - delete_meme（2026-07-12）：DELETE 按哨兵 scope + hash 过滤；rowcount → bool。
 - update_meme_description（2026-07-12）：UPDATE 只动 description /
   context_note 两列（created_at 等收录事实不动）；rowcount → bool（0 =
   并发被删，调用方折 unknown_meme）。
 
 不打真实 DB：recording / stub session 捕获语句，postgresql dialect 编译，
-与 test_task_store_contract 同式。
+与其它读侧契约测试同式。
 """
 
 from __future__ import annotations

@@ -89,7 +89,6 @@ class GroupMessageMapperContractTests(unittest.TestCase):
     def test_payload_includes_required_fields(self) -> None:
         partial = self.mapper.map(_make_message_event())
         for key in (
-            "msg_hash",
             "onebot_message_id",
             "raw_message",
             "sender",
@@ -97,6 +96,7 @@ class GroupMessageMapperContractTests(unittest.TestCase):
             "message_sub_type",
         ):
             self.assertIn(key, partial.payload)
+        self.assertNotIn("msg_hash", partial.payload)
         self.assertEqual(partial.payload["onebot_message_id"], "12345")
         self.assertEqual(partial.payload["sender"]["nickname"], "alice")
         self.assertEqual(
@@ -254,6 +254,7 @@ class GroupMessageMapperContractTests(unittest.TestCase):
         # 核心 4 键恒在（既有 payload 形状不变）
         for key in ("user_id", "nickname", "card", "role"):
             self.assertIn(key, payload["sender"])
+        self.assertNotIn("msg_hash", payload)
 
 
 class GroupRecallMapperContractTests(unittest.TestCase):
@@ -321,7 +322,9 @@ class FinalizeContractTests(unittest.TestCase):
         ev = finalize(
             partial,
             occurred_at=datetime(2026, 5, 26, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            event_id="0" * 25 + "B",
         )
+        self.assertEqual(ev.event_id, "0" * 25 + "B")
         self.assertEqual(ev.correlation_id, ev.event_id)
         self.assertIsNone(ev.causation_id)
         self.assertEqual(ev.idempotency_key, "k")
@@ -347,6 +350,46 @@ class FinalizeContractTests(unittest.TestCase):
         )
         self.assertEqual(ev.event_id, stamped)
         self.assertEqual(ev.correlation_id, stamped)
+
+    def test_internal_correlation_is_kept(self) -> None:
+        partial = PartialSystemEvent(
+            origin="agent",
+            type="agent.decision_emitted",
+            scope="group",
+            group_id=1,
+            user_id=None,
+            visibility="agent_visible",
+            payload={"program": ""},
+            raw=None,
+            idempotency_key=None,
+            correlation_id="TICK-CORR",
+            causation_id=None,
+        )
+        ev = finalize(
+            partial,
+            occurred_at=datetime(2026, 5, 26, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            event_id="0" * 25 + "C",
+        )
+        self.assertEqual(ev.correlation_id, "TICK-CORR")
+        self.assertEqual(ev.event_id, "0" * 25 + "C")
+
+    def test_finalize_requires_event_id(self) -> None:
+        partial = PartialSystemEvent(
+            origin="external",
+            type="external.message.group.normal",
+            scope="group",
+            group_id=1,
+            user_id=2,
+            visibility="agent_visible",
+            payload={},
+            raw=None,
+            idempotency_key="k",
+        )
+        occurred = datetime(2026, 5, 26, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with self.assertRaises(TypeError):
+            finalize(partial, occurred_at=occurred)  # type: ignore[call-arg]
+        with self.assertRaises(ValueError):
+            finalize(partial, occurred_at=occurred, event_id="")
 
 
 class IdempotencyHelpersTests(unittest.TestCase):
@@ -570,7 +613,7 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
             build_default_registry(), session_factory=recorder.factory
         )
         with patch(
-            "qqbot.services.event_gateway.registry.new_event_id",
+            "qqbot.services.event_gateway.registry.issue_event_id",
             return_value=stamped,
         ):
             result = await ingest.ingest(_UnknownEvent())
@@ -638,7 +681,7 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         try:
             with patch(
-                "qqbot.services.event_gateway.registry.new_event_id",
+                "qqbot.services.event_gateway.registry.issue_event_id",
                 side_effect=lambda: next(ids),
             ):
                 image_task = asyncio.create_task(ingest.ingest(image_event))
@@ -658,6 +701,168 @@ class IngestPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(
             (image_ev.occurred_at, image_ev.event_id),
             (text_ev.occurred_at, text_ev.event_id),
+        )
+
+    async def test_internal_channel_skips_pooling_window(self) -> None:
+        """模型/工具等内部通道即时领号，不空等 1s 聚水窗。"""
+        import time
+
+        recorder = _FakeSessionRecorder(rowcount=1)
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=recorder.factory,
+            registration_window_seconds=1.0,
+        )
+        started = time.monotonic()
+        result = await ingest.ingest_channel(
+            "model",
+            {"ok": True, "scope": "system"},
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.status, "inserted")
+        self.assertIsNotNone(result.event)
+        self.assertEqual(result.event.type, "runtime.model_responded")
+        self.assertLess(elapsed, 0.5)
+
+    async def test_planner_scene_registers_decision_or_invalid_action(self) -> None:
+        from qqbot.services.agent_loop.tool_registry import (
+            BaseTool,
+            ToolOutcome,
+            ToolRegistry,
+        )
+
+        class _NotifyTool(BaseTool):
+            name = "notify"
+            program_kind = "effect"
+            allowed_scopes = ("group",)
+            arguments_schema = {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+                "additionalProperties": False,
+            }
+            result_schema = {
+                "type": "object",
+                "properties": {"sent": {"type": "boolean"}},
+                "additionalProperties": False,
+            }
+
+            async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
+                return ToolOutcome.success({"sent": True})
+
+        registry = ToolRegistry()
+        registry.register(_NotifyTool)
+        recorder = _FakeSessionRecorder(rowcount=1)
+        ingest = EventIngest(
+            build_default_registry(),
+            session_factory=recorder.factory,
+            tool_registry=registry,
+        )
+        ok = await ingest.ingest_channel(
+            "model",
+            {
+                "ok": True,
+                "scene": "planner",
+                "program": 'notify(message="hi")',
+                "scope_key": "group:1",
+                "correlation_id": "CORR",
+                "tick_seq": 3,
+            },
+        )
+        self.assertEqual(ok.status, "inserted")
+        self.assertEqual(ok.event.type, "agent.decision_emitted")
+        self.assertEqual(ok.event.correlation_id, "CORR")
+        self.assertIsNotNone(ok.prepared)
+        bad = await ingest.ingest_channel(
+            "model",
+            {
+                "ok": True,
+                "scene": "planner",
+                "program": "import os",
+                "scope_key": "group:1",
+                "correlation_id": "CORR",
+                "tick_seq": 4,
+            },
+        )
+        self.assertEqual(bad.status, "inserted")
+        self.assertEqual(bad.event.type, "agent.invalid_action")
+        self.assertEqual(bad.event.payload["raw_text"], "import os")
+
+    async def test_tool_batch_skips_pool_and_keeps_preissued_id(self) -> None:
+        recorder = _FakeSessionRecorder(rowcount=1)
+        ingest = EventIngest(
+            build_default_registry(), session_factory=recorder.factory
+        )
+        result = await ingest.ingest_channel(
+            "tool",
+            {
+                "scope_key": "group:9",
+                "correlation_id": "TICK",
+                "events": [
+                    {
+                        "event_type": "agent.tool_called",
+                        "event_id": "PREISSUEDTOOL01" + "0" * 10,
+                        "causation_id": "DECISION",
+                        "payload": {"tool_name": "wait"},
+                    }
+                ],
+            },
+        )
+        self.assertEqual(result.status, "inserted")
+        self.assertEqual(result.event.type, "agent.tool_called")
+        self.assertEqual(result.event.event_id, "PREISSUEDTOOL01" + "0" * 10)
+        self.assertEqual(result.event.correlation_id, "TICK")
+        self.assertEqual(result.event.causation_id, "DECISION")
+
+    async def test_registrar_preserves_idempotency_key(self) -> None:
+        recorder = _FakeSessionRecorder(rowcount=1)
+        ingest = EventIngest(
+            build_default_registry(), session_factory=recorder.factory
+        )
+        result = await ingest.ingest(_make_message_event())
+        self.assertEqual(result.status, "inserted")
+        self.assertEqual(result.event.idempotency_key, "10000:msg:12345")
+        self.assertNotIn("msg_hash", result.event.payload)
+
+    async def test_file_hash_survives_registration(self) -> None:
+        from qqbot.services.event_ingest.media import MediaProcessingResult
+
+        file_hash = "a" * 64
+
+        async def fake_attach(
+            payload: dict,
+            describer: Any = None,
+            batch_describer: Any = None,
+        ) -> MediaProcessingResult:
+            _ = describer, batch_describer
+            for seg in payload.get("segments") or []:
+                if isinstance(seg, dict) and seg.get("type") == "image":
+                    seg["file_hash"] = file_hash
+            return MediaProcessingResult()
+
+        import qqbot.services.event_ingest.ingest as ingest_mod
+
+        original_attach = ingest_mod.attach_media_to_payload
+        ingest_mod.attach_media_to_payload = fake_attach
+        recorder = _FakeSessionRecorder(rowcount=1)
+        ingest = EventIngest(
+            build_default_registry(), session_factory=recorder.factory
+        )
+        try:
+            result = await ingest.ingest(
+                _make_message_event(
+                    message=[
+                        SimpleNamespace(
+                            type="image", data={"url": "http://x/y.png"}
+                        )
+                    ]
+                )
+            )
+        finally:
+            ingest_mod.attach_media_to_payload = original_attach
+        self.assertEqual(result.status, "inserted")
+        self.assertEqual(
+            result.event.payload["segments"][0]["file_hash"], file_hash
         )
 
 

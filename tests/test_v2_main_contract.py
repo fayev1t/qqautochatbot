@@ -8,6 +8,7 @@ Static-only. Verifies the plugin is wired up to:
 - translate only committed SystemEvent values into AgentLoop wakes
 - swallow ingest exceptions so napcat doesn't retry-spin
 - launch LoopSupervisor on startup, stop on shutdown
+- register the daily 00:00 <background> job, plus its lifecycle.connect catch-up
 - be discoverable by both __main__ PLUGIN_MODULES and pyproject plugin_dirs
 - v1 plugins MUST NOT appear in PLUGIN_MODULES (v1 fully discarded)
 """
@@ -35,7 +36,7 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("registration_window_seconds=1.0", self.plugin_text)
         self.assertIn("batch_image_describer=_describe_images", self.plugin_text)
         self.assertIn("set_inbound_gateway", self.plugin_text)
-        self.assertIn("set_model_outcome_sink", self.plugin_text)
+        self.assertIn("tool_registry=sup._tool_registry", self.plugin_text)
 
     def test_plugin_imports_event_ingest(self) -> None:
         self.assertIn(
@@ -156,6 +157,32 @@ class V2MainPluginContractTests(unittest.TestCase):
         self.assertIn("supervisor", self.plugin_text)
         self.assertIn(".start()", self.plugin_text)
         self.assertIn(".stop()", self.plugin_text)
+
+    def test_daily_background_is_wired_on_both_entrances(self) -> None:
+        """每日背景两条入口（2026-08-21，渲染格式表 §一①）。
+
+        调度器那条给出"每天一条"；lifecycle.connect 那条兜住"00:00 时进程是
+        关着的"——只有前者的话，白天重启一次就整天没有 ``<background>``，比它
+        取代的那个常驻头部还差。两条共用同一个幂等判据，所以叠加不会写重。
+
+        注册点在本 plugin 而不是 ``startup.py``：那边只管 DB 与调度器本身，
+        不认识 napcat。
+        """
+        self.assertIn(
+            "from qqbot.services.agent_loop.daily_background import",
+            self.plugin_text,
+        )
+        self.assertIn(
+            "register_daily_background_job(AsyncSessionLocal)", self.plugin_text
+        )
+        self.assertIn(
+            "schedule_catch_up_from_meta(bot, committed, AsyncSessionLocal)",
+            self.plugin_text,
+        )
+        startup_text = (
+            ROOT / "qqbot" / "plugins" / "startup.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("daily_background", startup_text)
 
     def test_no_legacy_toggle_env_vars(self) -> None:
         # v1 已删，过渡 env 开关也跟着删掉

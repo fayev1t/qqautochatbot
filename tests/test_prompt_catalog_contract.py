@@ -71,6 +71,16 @@ class AssemblyPinningTests(unittest.TestCase):
             },
         )
 
+    def test_assembler_is_the_scene_registry(self) -> None:
+        from qqbot.services.prompt_assembler import assemble, registered_scenes
+
+        self.assertEqual(registered_scenes(), tuple(CONSUMERS))
+        self.assertEqual(
+            assemble("web_digest"), render_system_prompt("web_digest")
+        )
+        with self.assertRaises(KeyError):
+            assemble("not_a_scene")
+
     def test_page_slot_lists_are_pinned(self) -> None:
         """每张根页实际用到哪几个槽、什么顺序——改动必须是有意的。
 
@@ -429,7 +439,11 @@ class FileAssemblyTests(unittest.TestCase):
         <reply-task-completed> / <my-reply> / <replyer-input>）不得复现。"""
         planner_env = build_library("planner").get("envelope")
         self.assertEqual(planner_env, self._md("envelope.md"))
-        for tag in ("<t>", "<m>", "<程序>", "<等待结束>", "<现在>"):
+        for tag in (
+            "<t>", "<msg>", "<tool>", "<action>", "<program_result>",
+            "<reflection>", "<invalid_action>", "<notice>", "<system>",
+            "<recall>", "<now>", "<memes>", "[img ", "[@ ", "[face ",
+        ):
             self.assertIn(tag, planner_env)
         self.assertNotIn("<校验拒绝>", planner_env)
         for stale in (

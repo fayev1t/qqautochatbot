@@ -136,8 +136,10 @@ class _FailEffect(_NotifyEffect):
         )
 
 
-class _CreateTaskEffect(BaseTool):
-    name = "task_create"
+class _RecordEffect(BaseTool):
+    """返回一个 event_id 的 effect，供后续调用当作保留参数的实参来源。"""
+
+    name = "record"
     program_kind = "effect"
     arguments_schema = {
         "type": "object",
@@ -147,21 +149,17 @@ class _CreateTaskEffect(BaseTool):
     }
     result_schema = {
         "type": "object",
-        "properties": {"task_id": {"type": "string"}},
+        "properties": {"event_id": {"type": "string"}},
         "additionalProperties": False,
     }
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
-        task_id = "T_NEW"
         return ToolOutcome.success(
-            {"task_id": task_id},
+            {"event_id": "EV_NEW"},
             emitted_events=[
                 ToolGeneratedEvent(
-                    event_type="agent.task_created",
-                    payload={
-                        "task_id": task_id,
-                        "triggered_by_event_id": context.get("triggered_by_event_id"),
-                    },
+                    event_type="agent.reflection_written",
+                    payload={"text": arguments["description"]},
                 )
             ],
         )
@@ -187,29 +185,34 @@ class _LongTextQuery(BaseTool):
 
 
 class _TaskLikeEffect(BaseTool):
-    """schema 自带业务 task_id 的 effect（形如 task 工具的 note/complete 分支）。"""
+    """schema 自带一个与保留名同名字段的 effect。
+
+    2026-08-21 前这个同名字段是 ``task_id``；任务坍缩后保留名只剩
+    ``triggered_by_event_id``，于是用它来验同一条规则：schema 声明了就是业务
+    参数，只进 arguments，不进保留挂靠通道。
+    """
 
     name = "task_like"
     program_kind = "effect"
     arguments_schema = {
         "type": "object",
         "properties": {
-            "task_id": {"type": "string"},
+            "triggered_by_event_id": {"type": "string"},
             "note": {"type": "string"},
         },
-        "required": ["task_id", "note"],
+        "required": ["triggered_by_event_id", "note"],
         "additionalProperties": False,
     }
     result_schema = {
         "type": "object",
-        "properties": {"task_id": {"type": "string"}},
+        "properties": {"echoed": {"type": "string"}},
         "additionalProperties": False,
     }
     calls: list[dict] = []
 
     async def execute(self, arguments: dict, **context: Any) -> ToolOutcome:
         type(self).calls.append({"arguments": dict(arguments), "context": context})
-        return ToolOutcome.success({"task_id": arguments["task_id"]})
+        return ToolOutcome.success({"echoed": arguments["triggered_by_event_id"]})
 
 
 class _HostValueQuery(BaseTool):
@@ -247,7 +250,6 @@ def _effect_handle(name: str = "tool") -> EffectCallHandle:
         called_event_id=f"CALLED_{name}",
         decision_id="DECISION",
         tool_name=name,
-        task_id=None,
         call_site=f"1:0:{name}:1",
         occurrence=1,
     )
@@ -403,7 +405,6 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
             called_event_id="CALLED1",
             decision_id="DECISION",
             tool_name="notify",
-            task_id=None,
             call_site="1:0:notify:1",
             occurrence=1,
         )
@@ -530,7 +531,6 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
             called_event_id="CALLED_FAIL",
             decision_id="DECISION",
             tool_name="fail_effect",
-            task_id=None,
             call_site="1:0:fail_effect:1",
             occurrence=1,
         )
@@ -556,17 +556,15 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
         # 第一次 finish 写的仍是失败终态。
         self.assertFalse(finish.await_args_list[0].kwargs["outcome"].ok)
 
-    async def test_declared_business_task_id_is_not_a_reserved_anchor(self) -> None:
-        """schema 已声明的业务 task_id 只进 arguments，不进保留挂靠通道——
-        与静态层 reserved = 保留名 - declared 同一口径。否则形如
-        task(action=\"note\"/\"complete\") 的调用会伴生一条伪造的
-        task_state_changed(pending→running)，把已收束任务复活。"""
+    async def test_declared_business_field_is_not_a_reserved_anchor(self) -> None:
+        """schema 已声明的同名字段只进 arguments，不进保留挂靠通道——
+        与静态层 reserved = 保留名 - declared 同一口径。否则工具自己的业务
+        参数会被执行层截走当成系统锚，工具收到的 arguments 里反而没有它。"""
         handle = EffectCallHandle(
             tool_call_id="TC_TASKLIKE",
             called_event_id="CALLED_TASKLIKE",
             decision_id="DECISION",
             tool_name="task_like",
-            task_id=None,
             call_site="1:0:task_like:1",
             occurrence=1,
         )
@@ -581,27 +579,37 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             result = await _execute(
-                'done = task_like(task_id="T1", note="进展")\nreturn done.task_id',
+                'done = task_like(triggered_by_event_id="E1", note="进展")\n'
+                "return done.echoed",
                 _registry(_TaskLikeEffect),
                 persist=False,
             )
 
-        self.assertEqual(result.result, "T1")
+        self.assertEqual(result.result, "E1")
         begin_kwargs = begin.await_args.kwargs
-        self.assertIsNone(begin_kwargs["task_id"])
-        self.assertEqual(begin_kwargs["arguments"]["task_id"], "T1")
-        self.assertEqual(_TaskLikeEffect.calls[0]["arguments"]["task_id"], "T1")
-        self.assertIsNone(_TaskLikeEffect.calls[0]["context"]["task_id"])
+        self.assertIsNone(begin_kwargs["triggered_by_event_id"])
+        self.assertEqual(begin_kwargs["arguments"]["triggered_by_event_id"], "E1")
+        self.assertEqual(
+            _TaskLikeEffect.calls[0]["arguments"]["triggered_by_event_id"], "E1"
+        )
+        self.assertIsNone(
+            _TaskLikeEffect.calls[0]["context"]["triggered_by_event_id"]
+        )
 
-    async def test_effect_result_variable_can_anchor_later_effect(self) -> None:
+    async def test_effect_result_variable_can_feed_a_reserved_argument(self) -> None:
+        """前一个 effect 的返回值可以当后一个 effect 保留参数的实参。
+
+        2026-08-21 前这条验的是 task_create 返回 task_id → 后续 effect
+        task_id=；任务坍缩后 task_id 值域消失，同一条组合性质改由
+        triggered_by_event_id 承担。
+        """
         handles = [
             EffectCallHandle(
-                tool_call_id="TC_TASK",
-                called_event_id="CALLED_TASK",
+                tool_call_id="TC_RECORD",
+                called_event_id="CALLED_RECORD",
                 decision_id="DECISION",
-                tool_name="task_create",
-                task_id=None,
-                call_site="1:0:task_create:1",
+                tool_name="record",
+                call_site="1:0:record:1",
                 occurrence=1,
             ),
             EffectCallHandle(
@@ -609,7 +617,6 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
                 called_event_id="CALLED_NOTIFY",
                 decision_id="DECISION",
                 tool_name="notify",
-                task_id="T_NEW",
                 call_site="2:0:notify:1",
                 occurrence=1,
             ),
@@ -621,30 +628,27 @@ class ProgramEffectContractTests(unittest.IsolatedAsyncioTestCase):
             ) as begin,
             patch(
                 "qqbot.services.agent_loop.program_runtime.finish_effect_call",
-                new=AsyncMock(side_effect=["TERM_TASK", "TERM_NOTIFY"]),
+                new=AsyncMock(side_effect=["TERM_RECORD", "TERM_NOTIFY"]),
             ),
         ):
             result = await _execute(
                 "\n".join(
                     [
-                        'task = task_create(description="work", '
-                        'triggered_by_event_id="EV1")',
-                        'notify(message="done", task_id=task.task_id)',
-                        "return task.task_id",
+                        'r = record(description="work")',
+                        'notify(message="done", triggered_by_event_id=r.event_id)',
+                        "return r.event_id",
                     ]
                 ),
-                _registry(_CreateTaskEffect, _NotifyEffect),
+                _registry(_RecordEffect, _NotifyEffect),
                 persist=False,
             )
 
-        self.assertEqual(result.result, "T_NEW")
-        self.assertEqual(result.trace.effect_call_ids, ["TC_TASK", "TC_NOTIFY"])
+        self.assertEqual(result.result, "EV_NEW")
+        self.assertEqual(result.trace.effect_call_ids, ["TC_RECORD", "TC_NOTIFY"])
         second_call = begin.await_args_list[1].kwargs
-        self.assertEqual(second_call["task_id"], "T_NEW")
-        self.assertEqual(second_call["triggered_by_event_id"], "EV1")
-        self.assertEqual(_NotifyEffect.calls[0]["context"]["task_id"], "T_NEW")
+        self.assertEqual(second_call["triggered_by_event_id"], "EV_NEW")
         self.assertEqual(
-            _NotifyEffect.calls[0]["context"]["triggered_by_event_id"], "EV1"
+            _NotifyEffect.calls[0]["context"]["triggered_by_event_id"], "EV_NEW"
         )
 
 

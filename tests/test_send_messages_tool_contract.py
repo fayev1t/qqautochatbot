@@ -6,7 +6,7 @@
 - 静态校验与 meme preflight 失败无副作用（不碰 OneBot）；
 - 结果语义：sent → success；partial / failed / uncertain → failure，
   status 与完整逐条 receipts 经 extra 平铺进 tool_failed payload，供投影渲染
-  该调用自己的 `<工具>send_messages` 行块（**不派生**第二份发言行）；
+  该调用自己的 `<tool>send_messages` 行块（**不派生**第二份发言行）；
 - allowed_scopes 只有 group；回执脱敏（base64 不进事件流）。
 """
 
@@ -111,7 +111,7 @@ class SendMessagesToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.result["message_ids"], [111, 222])
         self.assertEqual(len(bot.calls), 2)
         self.assertEqual(bot.calls[0]["group_id"], 100)
-        # receipts 随 result 落 terminal，供投影渲染 <工具>send_messages 行块。
+        # receipts 随 result 落 terminal，供投影渲染 <tool>send_messages 行块。
         receipts = outcome.result["sent_messages"]
         self.assertEqual(
             [item["status"] for item in receipts], ["sent", "sent"]
@@ -334,7 +334,7 @@ class SendMessagesMetadataTests(unittest.TestCase):
         """2026-08-17 删除 reply/ReplyTask：description 不再描述发言前置流程。
 
         "想好的话不会当拍就出去"现在由提案-裁决流水线在结构上保证（写下调用
-        的那一拍只落库，要等下一拍 execute_decision 指名），不是这个工具的
+        的那一拍只落库，要等下一拍 execute_program 指名），不是这个工具的
         参数面，也不该由它的介绍来交代。
         """
         desc = SendMessagesTool.description

@@ -51,8 +51,9 @@ class ToolRegistryContractTest(unittest.TestCase):
         self.assertEqual(spec.program_kind, "effect")
         self.assertEqual(spec.max_call_sites, 2)
         self.assertEqual(spec.required_permission, PermissionTier.GUEST)
-        self.assertIn("task_id=None", spec.signature)
         self.assertIn("triggered_by_event_id=None", spec.signature)
+        # 2026-08-21：task_id 随任务坍缩为单栏便签退出保留参数面（§一②）。
+        self.assertNotIn("task_id", spec.signature)
         self.assertIsNot(registry.get("stub"), registry.get("stub"))
 
     def test_legacy_query_kind_is_normalized_to_effect(self) -> None:
@@ -65,8 +66,8 @@ class ToolRegistryContractTest(unittest.TestCase):
         spec = registry.spec("query_stub")
         assert spec is not None
         self.assertEqual(spec.program_kind, "effect")
-        self.assertIn("task_id=None", spec.signature)
         self.assertIn("triggered_by_event_id=None", spec.signature)
+        self.assertNotIn("task_id", spec.signature)
 
     def test_scope_filtering_uses_same_specs_as_runtime(self) -> None:
         class _GroupOnly(_StubTool):
@@ -212,7 +213,7 @@ class ToolRegistryContractTest(unittest.TestCase):
                 "warnings",
             },
             "send_messages": {"message_ids", "sent_messages", "status"},
-            "task": {"action", "state", "task_id"},
+            "task": {"cleared", "chars"},
             "wait": {"note", "scheduled", "seconds", "wake_at"},
             "reflect": {"chars", "written"},
             "get_recent_thoughts": {"returned", "ticks"},

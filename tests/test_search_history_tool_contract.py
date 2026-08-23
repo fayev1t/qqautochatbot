@@ -1,13 +1,15 @@
 """Contract tests for SearchHistoryTool.
 
 Covers:
-- arguments 参数解析（task_id / anchor_event_id / start_time / end_time / query / limit）
+- arguments 参数解析（anchor_event_id / start_time / end_time / query / limit）
 - scope_key 缺失 / 非法 → 返回 ToolOutcome.failure(invalid_arguments)（工具永不 raise）
-- task_id 解析为 triggered_by_event_id 锚点；查不到 → warning，不报错
 - limit 兜底（默认 / 上限）
 - 返回结构复用 Projector 渲染器，items 字段同构
+- task_id 锚点路径已删除（2026-08-21，渲染格式表 §一②）：它读的是
+  agent.task_created.payload.triggered_by_event_id，而任务坍缩为单栏便签后
+  没有任务、没有 task_id、也没有起因事件。
 
-不打真实 DB：直接 stub _query / _resolve_task_anchor 方法，验证调用面。
+不打真实 DB：直接 stub _query 方法，验证调用面。
 """
 
 from __future__ import annotations
@@ -81,11 +83,10 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         self,
         *,
         query_returns: list[_StubRow] | None = None,
-        anchor_returns: str | None = None,
     ) -> SearchHistoryTool:
-        """构造工具，替换 _query 与 _resolve_task_anchor 为 stub。"""
+        """构造工具，替换 _query 为 stub。"""
         # 无构造依赖；session_factory 现从 run() context 进，且这些用例都 stub
-        # 掉了 _query / _resolve_task_anchor，session_factory 不会被走到。
+        # 掉了 _query，session_factory 不会被走到。
         tool = SearchHistoryTool()
         self.captured_query_kwargs: dict[str, Any] = {}
 
@@ -93,12 +94,7 @@ class SearchHistoryToolContractTest(unittest.TestCase):
             self.captured_query_kwargs = kwargs
             return query_returns or []
 
-        async def _stub_anchor(task_id: str) -> str | None:
-            self.captured_resolve_task_id = task_id
-            return anchor_returns
-
         tool._query = _stub_query  # type: ignore[method-assign]
-        tool._resolve_task_anchor = _stub_anchor  # type: ignore[method-assign]
         return tool
 
     def test_scope_key_missing_returns_invalid_arguments(self) -> None:
@@ -113,7 +109,10 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         self.assertEqual(outcome.error_kind, "invalid_arguments")
 
     def test_happy_path_returns_rendered_items(self) -> None:
-        rows = [_msg("hello world", seconds_offset=i, event_id=f"E{i:02d}") for i in range(3)]
+        rows = [
+            _msg("hello world", seconds_offset=i, event_id=f"E{i:02d}")
+            for i in range(3)
+        ]
         tool = self._make_tool(query_returns=rows)
         result = _ok(tool, {"limit": 10}, scope_key="group:999")
         self.assertEqual(result["matched"], 3)
@@ -151,30 +150,21 @@ class SearchHistoryToolContractTest(unittest.TestCase):
         )
         self.assertEqual(self.captured_query_kwargs["anchor_event_id"], "ANCHOR123")
 
-    def test_task_id_resolved_to_anchor(self) -> None:
-        tool = self._make_tool(anchor_returns="RESOLVED_ANCHOR")
-        result = _ok(tool, {"task_id": "T1"}, scope_key="group:999")
-        self.assertEqual(self.captured_query_kwargs["anchor_event_id"], "RESOLVED_ANCHOR")
-        self.assertEqual(result["anchor_event_id"], "RESOLVED_ANCHOR")
-        # 无 warning：解析成功
-        self.assertEqual(result["warnings"], [])
+    def test_task_id_is_not_an_argument_anymore(self) -> None:
+        """2026-08-21：锚点只剩 anchor_event_id 一条路（§一②）。
 
-    def test_task_id_with_no_anchor_warns(self) -> None:
-        tool = self._make_tool(anchor_returns=None)
-        result = _ok(tool, {"task_id": "T_MISSING"}, scope_key="group:999")
-        self.assertIsNone(self.captured_query_kwargs["anchor_event_id"])
-        self.assertTrue(any("T_MISSING" in w for w in result["warnings"]))
-
-    def test_explicit_anchor_wins_over_task_id(self) -> None:
-        tool = self._make_tool(anchor_returns="FROM_TASK")
-        asyncio.run(
-            tool.run(
-                {"anchor_event_id": "EXPLICIT", "task_id": "T1"},
-                scope_key="group:999",
-            )
+        schema 里没有 task_id，工具也不再有 _resolve_task_anchor。传进来的
+        task_id 是个陌生字段，不影响锚点——它既不会被解析成锚，也不会伪装成
+        "解析失败"混进 warnings 里让模型以为自己写对了参数。
+        """
+        self.assertNotIn(
+            "task_id", SearchHistoryTool.arguments_schema["properties"]
         )
-        # 显式 anchor 优先，不会回去查 task
-        self.assertEqual(self.captured_query_kwargs["anchor_event_id"], "EXPLICIT")
+        self.assertFalse(hasattr(SearchHistoryTool, "_resolve_task_anchor"))
+        tool = self._make_tool()
+        result = _ok(tool, {"task_id": "T1"}, scope_key="group:999")
+        self.assertIsNone(self.captured_query_kwargs["anchor_event_id"])
+        self.assertEqual(result["warnings"], [])
 
     def test_time_window_parsed_to_datetimes(self) -> None:
         tool = self._make_tool()

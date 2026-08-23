@@ -12,7 +12,7 @@
 6. 启动语义——worker 启动不扫描、不查询、不调用 LLM。
 
 全离线：_ScriptedSession 按调用顺序回放查询结果并捕获 insert（照
-test_task_store_contract 的 fake 惯例）；LLM / 系统提示词 / 渲染均注入假件。
+仓库通行的 fake 惯例）；LLM / 系统提示词 / 渲染均注入假件。
 """
 
 from __future__ import annotations

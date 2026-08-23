@@ -10,7 +10,7 @@ Contracts:
   但 **重模块惰性化**:LLMPlanner / Projector / AgentLoop /
   LoopSupervisor / ToolRegistry 等会拉 sqlalchemy(DB)或 langchain(LLM),
   改用 PEP 562 module `__getattr__` 按需导入。于是 `import qqbot.services.
-  agent_loop`(或导入其任一**纯**子模块,如 decision / task_store 的纯函数部分)
+  agent_loop`(或导入其任一**纯**子模块,如 decision)
   不再连带把整套运行时拉进来;`from qqbot.services.agent_loop import LLMPlanner`
   语义不变 —— 首次访问该名字时才 import llm_planner。
 """
@@ -27,9 +27,6 @@ from qqbot.services.agent_loop.decision import (
     ImageRef,
     MemeView,
     Planner,
-    ProgramValidationFeedback,
-    ProgressNote,
-    TaskView,
     TimelineItem,
     ToolResultView,
 )
@@ -81,12 +78,9 @@ __all__ = [
     "LoopSupervisor",
     "MemeView",
     "Planner",
-    "ProgramValidationFeedback",
     "PromptLibrary",
     "build_default_prompt_library",
-    "ProgressNote",
     "Projector",
-    "TaskView",
     "TimelineItem",
     "Tool",
     "ToolRegistry",

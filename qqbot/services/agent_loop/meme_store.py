@@ -9,7 +9,7 @@ scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，
 (scope_key, file_hash) 退化为全局一图一条；将来要恢复分域只改本模块）。
 存量分群数据需一次性迁移合并到哨兵 scope，见 表情包工具黑盒设计.md §2。
 
-对外接口（全部独立事务、每次新开 session，与 task_store 同风格）：
+对外接口（全部独立事务、每次新开 session）：
 
   get_meme(factory, hash)          单条精确查。发送（send_messages 的 meme
                                    气泡）的权限边界（只有收录过的才能发）与
@@ -37,7 +37,7 @@ scope_key 列固定写 MEME_SCOPE_GLOBAL 哨兵（列保留，表结构不变，
 
 失败语义：本模块**不吞异常** —— DB 失败原样 raise，由调用方决定降级（工具层
 经 BaseTool.run 兜底成 internal_tool_error；投影层 try/except 降级为本 tick 不
-渲染收藏夹），与 load_active_tasks 的约定一致。
+渲染收藏夹）。
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ async def load_saved_memes(
 
 
 def _row_to_meme_view(row: Any) -> MemeView:
-    """AgentMeme ORM row → MemeView（时区 normalize 与 task_store 一致）。"""
+    """AgentMeme ORM row → MemeView（时区 normalize 见 _norm_china）。"""
     return MemeView(
         file_hash=row.file_hash,
         description=row.description or "",
@@ -226,7 +226,7 @@ def _row_to_meme_view(row: Any) -> MemeView:
 
 def _norm_china(dt: datetime | None) -> datetime:
     """asyncpg 把 TIMESTAMPTZ 读回 UTC tzinfo；统一 normalize 到北京时间，
-    与 task_store._norm_china / projection._snapshot_from_row 保持一致。"""
+    与 projection._snapshot_from_row 保持一致。"""
     if dt is not None and dt.tzinfo is not None:
         return dt.astimezone(CHINA_TIMEZONE)
     return dt  # type: ignore[return-value]

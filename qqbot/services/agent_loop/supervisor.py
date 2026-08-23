@@ -14,7 +14,7 @@ Behaviour:
 - stop() cancels every running loop with a 5s grace timeout.
 
 Programs are enqueued only when a later tick commits them by event id
-(``execute_decision``); a per-scope ProgramRunner executes them concurrently.
+(``execute_program``); a per-scope ProgramRunner executes them concurrently.
 There is no ToolWorker, no ReplyExecutor, no pending-tool notification, and no
 tool-batch completion wake.
 """
@@ -78,21 +78,10 @@ class LoopSupervisor:
     async def start(self) -> None:
         if self._started or self._stopped:
             return
-        # 任务读模型回填：把最近 N 天未完成任务灌进 agent_tasks，覆盖"首次部署
-        # 本特性"和"读模型漂移"。在拉起任何 loop 之前跑，让 system/group loop
-        # 第一 tick 就能从表里看到窗口外的旧任务。best-effort，失败不挡启动。
-        try:
-            from qqbot.services.agent_loop.task_store import backfill_recent
-
-            replayed = await backfill_recent(self._session_factory)
-            logger.info(
-                "[supervisor] task read-model backfill: {} task event(s) replayed",
-                replayed,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[supervisor] task backfill failed (continuing): {}", exc
-            )
+        # 任务读模型回填已于 2026-08-21 删除（渲染格式表 §一②）：agent_tasks
+        # 表随任务坍缩为单栏便签一并取消，没有读模型也就没有要回填的漂移。
+        # 便签的跨窗口持久由 Projector._fetch_latest_task_note 每拍一条 LIMIT 1
+        # 查询承担，不需要启动期预热。
         # 计时器由可见事实落库武装；silence_elapsed 本身不算动静。
         self._silence_watcher = SilenceWatcher(
             self._session_factory, self.wake

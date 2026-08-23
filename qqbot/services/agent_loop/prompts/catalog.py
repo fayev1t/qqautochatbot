@@ -51,7 +51,7 @@ save/recaption 的看图调用）此前有自己的 `meme_caption.md`——一�
   - `planner.md`  Planner 的行为约定，一页读完：角色模拟职责→系统运行事实与
                   行动纪律（念头≠动作 / 跨拍靠任务 / 一批工具不要重拨）及
                   提案-裁决流水线（写下的程序当拍不执行 → 下一拍
-                  `execute_decision` 指名才跑；2026-08-17 取代 reply 两步
+                  `execute_program` 指名才跑；2026-08-17 取代 reply 两步
                   发言）→唯一人物模型→输入信封→决策要求→工具规范→程序
                   输出协议。
   - 另外五个小消费者页内无槽，其中 `caption` 与 `image_description` **共用同一

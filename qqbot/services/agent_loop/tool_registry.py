@@ -105,7 +105,7 @@ class ToolOutcome:
     工具直接产出 outcome（成功 → ``result``；失败 → ``error_kind`` /
     ``error_message`` / ``extra``）。执行层只把它机械搬运成
     ``agent.tool_result`` / ``agent.tool_failed``，**不再 introspect 异常类型、不猜
-    error_kind**（契约 §6/§7.2）；Projection 据这两类事件渲染 ``<工具>`` 行
+    error_kind**（契约 §6/§7.2）；Projection 据这两类事件渲染 ``<tool>`` 行
     （两态：``完成`` + 结果行 / ``失败`` + 原因行）。
 
     ``error_kind`` 收敛成固定语义集（见 planner.md §输入信封格式规范 的 <error>、
@@ -206,8 +206,8 @@ class Tool(Protocol):
 
         BaseTool 子类改实现 `execute()`、继承 `BaseTool.run()`（统一出口、永不
         raise）。`arguments` 是 LLM 给的、匹配 `arguments_schema` 的 dict；
-        `context` 是系统注入的同一套 kwargs（scope_key / task_id / correlation_id
-        / session_factory / triggered_by_event_id / bot_role ...），每个工具收到
+        `context` 是系统注入的同一套 kwargs（scope_key / correlation_id /
+        session_factory / triggered_by_event_id / bot_role ...），每个工具收到
         的完全相同，故无需任何 __init__ 接线。详见 BaseTool。
         """
         ...
@@ -718,7 +718,7 @@ class ToolRegistry:
         sections = [
             "程序函数只能用具名参数调用。每次调用都会留下一条终态工具记录；"
             "程序结束后，除这些调用记录外，只有 return 的 JSON 会作为 "
-            "<程序>完成 的结果行留到下一拍。\n\n"
+            "<program_result> 的结果行留到下一拍。\n\n"
             "下面每个函数的返回 schema 里，`ok` 与 `error` 是所有函数共有的："
             "`ok` 为 true 时业务字段有效、`error` 为 null；`ok` 为 false 时"
             "业务字段全是 null，`error` 给出 `kind` / `message` / `status`。"
@@ -734,9 +734,17 @@ class ToolRegistry:
             if spec.allowed_scopes:
                 meta.append("scope=" + ",".join(spec.allowed_scopes))
             meta.append(f"静态调用点<={spec.max_call_sites}")
-            reserved = (
-                "额外保留具名参数：task_id=None、triggered_by_event_id=None。"
-            )
+            # 敏感工具（required_permission > GUEST）的这句话是硬要求，不是
+            # 提示：2026-08-21 任务坍缩后没有了"从任务起因回填发起人"的回退，
+            # 不传就是 GUEST，就会被拒。
+            if spec.required_permission > PermissionTier.GUEST:
+                reserved = (
+                    "额外保留具名参数：triggered_by_event_id=None"
+                    "（本工具需要发起人权限，**必须显式传**触发它的那条事件的"
+                    " ev: 值；省略即按 GUEST 判定，多半会被拒）。"
+                )
+            else:
+                reserved = "额外保留具名参数：triggered_by_event_id=None。"
             block = [
                 f"## 程序函数：{spec.name}",
                 "",
@@ -815,8 +823,6 @@ def _program_signature(
             parameters.append(
                 f"{field_name}={_python_literal(field_schema.get('default'))}"
             )
-    if "task_id" not in properties:
-        parameters.append("task_id=None")
     if "triggered_by_event_id" not in properties:
         parameters.append("triggered_by_event_id=None")
     if not parameters:

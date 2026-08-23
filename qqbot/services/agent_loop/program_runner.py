@@ -14,7 +14,9 @@ look_at_image，秒~数十秒），副作用调用全是亚秒级的。串行队
 
 - ``outbound_messages.send_all`` 的 per-scope 互斥，保证同一次 send_messages
   的气泡不被另一段程序劈开（只管连续性，不判重、不认领、不设 TTL）；
-- "要不要再说一次"仍由下一拍模型对着 ``<程序>决策`` 与 ``<工具>`` 终态判断。
+- "要不要再说一次"仍由下一拍模型对着 ``<action>`` 与 ``<tool>`` 终态判断。
+  2026-08-21 起这条更吃重：``already_executed`` 守卫取消后，同一份代码资产
+  指几次就跑几次，系统一侧再没有任何东西替模型拦住重复。
 
 并发上限 ``AGENT_PROGRAM_MAX_CONCURRENCY`` 防的是 fan-out（每段程序都可能挂着
 HTTP + LLM 调用），不是防重复发言；置 1 即退回串行。
@@ -80,6 +82,11 @@ class QueuedProgram:
     prepared: PreflightResult
     context: DecisionContext
     enqueued_at: datetime
+    # 下达 execute_program 的那条决策事件（2026-08-21）。terminal 靠
+    # (dispatch_event_id, program_hash) 唯一确定一次运行——取消
+    # already_executed 后同一份资产可以合法并发跑多次，只凭 hash 分不出
+    # 是哪一次。空程序在自己那一拍收口、没有调度事件，故可为 None。
+    dispatch_event_id: str | None = None
 
 
 ExecuteQueued = Callable[[QueuedProgram], Awaitable[None]]

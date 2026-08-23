@@ -94,7 +94,12 @@ def should_snapshot(scope_key: str | None) -> bool:
 
 @dataclass
 class SnapshotAttempt:
-    """单次 LLM 往返（同 tick JSON 解析重试会产生多条）。"""
+    """单次 LLM 往返。
+
+    Planner 侧一拍恒为一条：2026-08-21 起「一个响应绑定一次模型执行」，同拍
+    静态重试链路已撤销，快照与拍一一对应（渲染格式表 §一⑦）。辅助 LLM 若自带
+    解析重试仍可产生多条。
+    """
 
     latency_ms: int | None = None
     response_text: str | None = None
@@ -122,7 +127,6 @@ class PromptSnapshot:
     images: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[SnapshotAttempt] = field(default_factory=list)
     outcome: str | None = None
-    validation_retry: bool = False
 
     def add_attempt(
         self,
@@ -270,7 +274,6 @@ def _to_payload(snapshot: PromptSnapshot) -> dict[str, Any]:
         "scope_key": snapshot.scope_key,
         "tick_seq": snapshot.tick_seq,
         "correlation_id": snapshot.correlation_id,
-        "validation_retry": snapshot.validation_retry,
         "model": snapshot.model,
         "system_prompt_chars": len(system_prompt),
         "system_prompt_sha256": _sha256(system_prompt),

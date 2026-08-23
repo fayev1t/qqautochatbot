@@ -331,16 +331,13 @@ class ProgramExecutor:
             state.trace.duration_ms = _elapsed_ms(started)
             _log_trace(state.trace)
 
-    def task_anchor(self, task_id: str | None) -> str | None:
-        if task_id is None:
-            return None
-        context = self._context
-        if context is None:
-            return None
-        for task in context.active_tasks:
-            if task.task_id == task_id:
-                return task.triggered_by_event_id
-        return None
+    # task_anchor 已于 2026-08-21 删除（渲染格式表 §一②/§八10）。它是敏感工具
+    # 发起人反查的**回退路径**：调用挂在某个任务上而没显式传
+    # triggered_by_event_id 时，运行时拿任务的起因事件顶上。便签没有 ID、
+    # 也没有起因，这条路径没有等价物——发起人凭据现在只剩模型显式传
+    # triggered_by_event_id= 一条路，不传则按 GUEST 保守拒绝
+    # （tool_registry._resolve_triggering_tier）。不要发明新的隐式回退：
+    # 猜出来的凭据比没有凭据更危险。
 
 
 @dataclass
@@ -349,7 +346,6 @@ class _RuntimeState:
     program: PreflightResult
     deadline: float
     trace: ProgramTrace
-    created_task_anchors: dict[str, str | None] = field(default_factory=dict)
     query_call_count: int = 0
 
     def globals(self) -> dict[str, Any]:
@@ -568,28 +564,16 @@ class _RuntimeState:
         properties = _schema_properties(schema)
         declared = set(properties)
         # 保留通道判定与静态层同一口径(program_ast:reserved = 保留名 - declared):
-        # schema 已声明的同名字段是业务参数,只进 arguments,不当挂靠锚——否则
-        # task(action="note"/"complete"/"fail") 的业务 task_id 会伴生一条伪造的
-        # task_state_changed(pending→running),把已收束任务复活成 running。
-        task_id = raw_kwargs.get("task_id") if "task_id" not in declared else None
+        # schema 已声明的同名字段是业务参数,只进 arguments,不当挂靠锚。
         triggered = (
             raw_kwargs.get("triggered_by_event_id")
             if "triggered_by_event_id" not in declared
             else None
         )
         arguments = dict(raw_kwargs)
-        if "task_id" not in declared:
-            arguments.pop("task_id", None)
         if "triggered_by_event_id" not in declared:
             arguments.pop("triggered_by_event_id", None)
 
-        if task_id is not None and not isinstance(task_id, str):
-            return await self._invalid_reserved_effect_call(
-                spec,
-                site,
-                arguments,
-                "task_id must be a string or null",
-            )
         if triggered is not None and not isinstance(triggered, str):
             return await self._invalid_reserved_effect_call(
                 spec,
@@ -597,10 +581,11 @@ class _RuntimeState:
                 arguments,
                 "triggered_by_event_id must be a string or null",
             )
-        if triggered is None and isinstance(task_id, str):
-            triggered = self.created_task_anchors.get(task_id)
-            if triggered is None:
-                triggered = self.executor.task_anchor(task_id)
+        # 2026-08-21：这里曾有一条回退——triggered 为空但挂了 task_id 时，去
+        # created_task_anchors / executor.task_anchor 取任务的起因事件顶上。
+        # 任务坍缩为单栏便签后 task_id 值域消失，回退随之删除。省略
+        # triggered_by_event_id 的敏感调用现在会一路走到 GUEST 判定被拒，
+        # 这是**有意的**：宁可明确失败，也不猜一个发起人出来。
 
         self.query_call_count += 1
         if self.query_call_count > MAX_PROGRAM_CALLS:
@@ -616,7 +601,6 @@ class _RuntimeState:
             spec,
             site,
             arguments,
-            task_id=task_id,
             triggered_by_event_id=triggered,
         )
 
@@ -631,7 +615,6 @@ class _RuntimeState:
             spec,
             site,
             arguments,
-            task_id=None,
             triggered_by_event_id=None,
             forced_outcome=ToolOutcome.failure("invalid_arguments", message),
         )
@@ -642,7 +625,6 @@ class _RuntimeState:
         site: ProgramCallSite,
         arguments: dict[str, Any],
         *,
-        task_id: str | None,
         triggered_by_event_id: str | None,
         forced_outcome: ToolOutcome | None = None,
     ) -> Any:
@@ -654,7 +636,6 @@ class _RuntimeState:
             decision_id=self.executor._decision_id,
             tool_name=spec.name,
             arguments=arguments,
-            task_id=task_id,
             triggered_by_event_id=triggered_by_event_id,
             bot_role=context.bot_role if context is not None else None,
             call_site=site.call_site,
@@ -671,7 +652,6 @@ class _RuntimeState:
                 outcome = await self._call_tool(
                     spec,
                     arguments,
-                    task_id=task_id,
                     triggered_by_event_id=triggered_by_event_id,
                     tool_call_event_id=handle.called_event_id,
                 )
@@ -772,13 +752,9 @@ class _RuntimeState:
             )
             return self._failure_value(spec, outcome)
 
-        for event in outcome.emitted_events:
-            if event.event_type == "agent.task_created":
-                created_id = event.payload.get("task_id")
-                if isinstance(created_id, str):
-                    self.created_task_anchors[created_id] = event.payload.get(
-                        "triggered_by_event_id"
-                    )
+        # 这里曾把 agent.task_created 的 task_id → triggered_by_event_id 记进
+        # created_task_anchors，供同程序内后续调用省略 triggered_by_event_id。
+        # 随任务坍缩为单栏便签一并删除（2026-08-21）。
         result_bytes = _result_size(outcome.result)
         try:
             wrapped = wrap_program_value(
@@ -814,7 +790,6 @@ class _RuntimeState:
         spec: ProgramFunctionSpec,
         arguments: dict[str, Any],
         *,
-        task_id: str | None,
         triggered_by_event_id: str | None,
         tool_call_event_id: str | None,
     ) -> ToolOutcome:
@@ -832,7 +807,6 @@ class _RuntimeState:
                 tool.run(
                     arguments,
                     scope_key=self.executor._scope_key,
-                    task_id=task_id,
                     correlation_id=self.executor._correlation_id,
                     session_factory=self.executor._session_factory,
                     triggered_by_event_id=triggered_by_event_id,

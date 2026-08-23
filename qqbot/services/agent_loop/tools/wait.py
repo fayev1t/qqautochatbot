@@ -63,7 +63,7 @@ class WaitTool(BaseTool):
     max_call_sites = 2
     description = (
         "在指定秒数后为当前 scope 安排一次唤醒。计时器触发时写入包含 note 的 "
-        "<系统>wait_elapsed 行并启动新 tick。计时器仅保存在进程内存中，进程"
+        "<system>wait_elapsed 行并启动新 tick。计时器仅保存在进程内存中，进程"
         "重启后不会恢复；工具调用记录仍保留在时间线中。"
     )
     usage_prompt = _USAGE_PROMPT

@@ -46,7 +46,6 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
 from qqbot.models.agent_image_caption import AgentImageCaption
@@ -159,14 +158,9 @@ async def _invoke_vision_batch(
     prompt: str,
     prepared: list[tuple[int, bytes, str, str]],
 ) -> list[str | None]:
-    llm = await create_llm(role="vision")
-    if llm is None:
-        logger.warning(
-            "[image_description] no vision-capable LLM configured "
-            "(config/model_providers.json 缺失，或 role=vision 无候选)"
-        )
-        return [None] * len(prepared)
     from langchain_core.messages import HumanMessage
+
+    from qqbot.services.event_gateway.outbound import invoke
 
     n = len(prepared)
     user_text = (
@@ -183,16 +177,18 @@ async def _invoke_vision_batch(
                 "image_url": {"url": f"data:{payload_mime};base64,{b64}"},
             }
         )
-    try:
-        raw = await llm.ainvoke([HumanMessage(content=content)])
-    except Exception as exc:
+    invoked = await invoke(
+        "image_description",
+        [HumanMessage(content=content)],
+        extra={"batch_size": n},
+    )
+    if not invoked.ok:
         logger.warning(
-            "[image_description] batch VLM call failed: {}: {}",
-            type(exc).__name__,
-            exc,
+            "[image_description] batch VLM call failed: {}",
+            invoked.error,
         )
         return [None] * n
-    parsed = _parse_description_list(_extract_text(raw).strip(), n)
+    parsed = _parse_description_list(invoked.text.strip(), n)
     return [item[:MAX_DESCRIPTION_CHARS] if item else None for item in parsed]
 
 
@@ -370,9 +366,9 @@ async def _store(
 def _load_prompt(consumer: str) -> str:
     """required 段：文件缺失/为空时 render 直接 raise，由调用方折成失败
     （不静默拿空指令看图——那会写出一段没有信息量的描述并永久缓存）。"""
-    from qqbot.services.agent_loop.prompts.catalog import render_system_prompt
+    from qqbot.services.prompt_assembler import assemble
 
-    return render_system_prompt(consumer)
+    return assemble(consumer)
 
 
 async def _invoke_vision(
@@ -390,15 +386,9 @@ async def _invoke_vision(
     # 温度在 vision 这条 role 指向的**端点**上配（2026-08-14 起采样参数只在
     # providers[].models[] 上声明）。建议低温 0.2：同一张图的客观描述应当稳定，
     # 不需要发散；与 caption 同理。见 LLM 路由契约 §2。
-    llm = await create_llm(role="vision")
-    if llm is None:
-        logger.warning(
-            "[image_description] no vision-capable LLM configured "
-            "(config/model_providers.json 缺失，或 role=vision 无候选)"
-        )
-        return None, None
-
     from langchain_core.messages import HumanMessage
+
+    from qqbot.services.event_gateway.outbound import invoke
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
     message = HumanMessage(
@@ -411,14 +401,14 @@ async def _invoke_vision(
         ]
     )
 
-    model_spec = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+    scene = "image_look" if kind == "image_look" else "image_description"
     # Prompt 快照：脱敏契约要求 base64 永不落盘，图片只记 hash/mime/字节数。
     # scope_key=None —— 描述按 hash 全局共享，不属于任何单一 scope。
     snapshot: PromptSnapshot | None = None
     if should_snapshot(None):
         snapshot = PromptSnapshot(
             kind=kind,
-            model=model_spec,
+            model=None,
             user_text=prompt,
             images=[
                 {"hash": file_hash, "mime": mime, "bytes": len(image_bytes)}
@@ -426,34 +416,29 @@ async def _invoke_vision(
         )
 
     started = time.monotonic()
-    try:
-        raw = await llm.ainvoke([message])
-    except Exception as exc:
-        logger.warning(
-            "[image_description] VLM call failed ({}): {}: {} hash={}",
-            kind,
-            type(exc).__name__,
-            exc,
-            file_hash,
-        )
-        if snapshot is not None:
-            snapshot.add_attempt(
-                latency_ms=int((time.monotonic() - started) * 1000),
-                error=f"{type(exc).__name__}: {exc}"[:300],
-            )
-            snapshot.outcome = "call_error"
-            write_snapshot(snapshot)
-        return None, None
-
-    text = _extract_text(raw).strip()
+    invoked = await invoke(scene, [message], extra={"file_hash": file_hash})
     if snapshot is not None:
         snapshot.add_attempt(
             latency_ms=int((time.monotonic() - started) * 1000),
-            response_text=text,
-            usage=extract_usage(raw),
+            response_text=invoked.text,
+            usage=extract_usage(invoked.raw),
+            error=invoked.error,
         )
-        snapshot.outcome = "ok" if text else "empty_response"
+        snapshot.outcome = (
+            "call_error"
+            if not invoked.ok
+            else ("ok" if invoked.text.strip() else "empty_response")
+        )
         write_snapshot(snapshot)
+    if not invoked.ok:
+        logger.warning(
+            "[image_description] VLM call failed ({}) hash={} err={}",
+            kind,
+            file_hash,
+            invoked.error,
+        )
+        return None, None
+    text = invoked.text.strip()
     if not text:
         logger.warning(
             "[image_description] VLM returned empty text ({}) hash={}",
@@ -461,6 +446,9 @@ async def _invoke_vision(
             file_hash,
         )
         return None, None
+    model_spec = getattr(invoked.raw, "model_name", None) or getattr(
+        invoked.raw, "model", None
+    )
     return text[:max_chars], model_spec
 
 

@@ -10,8 +10,6 @@
 所有过滤条件均为可选，多个条件使用 AND 组合：
 
 - `anchor_event_id`：仅返回严格早于该 ULID 事件 ID 的事件。
-- `task_id`：未提供 `anchor_event_id` 时，工具读取该任务创建事件的
-  `triggered_by_event_id` 作为锚点。
 - `start_time`：ISO8601 起始时间，包含边界。
 - `end_time`：ISO8601 结束时间，包含边界。
 - `query`：对消息 `search_text` 执行 pg_trgm 模糊相似度匹配，不要求精确
@@ -38,15 +36,14 @@ scope 按 `user_id` 过滤。参数中不存在跨 scope 的目标字段。
       "event_id": "01...",
       "occurred_at": "2026-07-30T12:00:00+08:00",
       "kind": "message",
-      "render": "<m>名字(QQ) #消息ID: 正文"
+      "render": "<msg>名字(QQ) #消息ID: 正文"
     }
   ],
   "warnings": []
 }
 ```
 
-`items` 按事件时间正序排列。`task_id` 无法解析出锚点，或时间字符串无法解析
-时，对应过滤条件会被跳过并写入 `warnings`，调用仍可成功。没有匹配项时
-`matched=0` 且 `items=[]`。
+`items` 按事件时间正序排列。时间字符串无法解析时，对应过滤条件会被跳过并
+写入 `warnings`，调用仍可成功。没有匹配项时 `matched=0` 且 `items=[]`。
 
 缺少或无法解析 `scope_key` 时返回 `invalid_arguments`。

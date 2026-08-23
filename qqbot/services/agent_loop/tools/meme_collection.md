@@ -26,7 +26,7 @@ EventIngest 已落盘的内容寻址文件，不由本工具复制或删除。
   `recaption`。该字段作为描述生成的附加上下文，不直接展示给用户。
   `recaption` 省略该字段时复用收录时保存的上下文。
 
-`save` 的 hash 对应时间线 `<图 …>` 段里的 12 位前缀；`delete` 和
+`save` 的 hash 对应时间线 `[img …]` 段里的 12 位前缀；`delete` 和
 `recaption` 的 hash 对应表情包收藏 `<meme>` 行里的 12 位前缀，原样照抄即可。
 hash 会归一化为小写。
 

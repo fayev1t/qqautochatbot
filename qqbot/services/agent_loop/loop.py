@@ -1,13 +1,15 @@
 """Long-running per-scope loop for program-shaped Planner decisions.
 
-Each tick projects the scope, asks the Planner for one restricted Python
-program, preflights it, and on static failure cools the current LLM endpoint
-then tries the next candidate in the role group (no same-tick rewrite with
-validation feedback). The decision root is always persisted.
+Each tick projects the scope, asks the Planner for exactly one restricted
+Python program, and hands that single response to the registrar
+(``program_registrar``), which validates it and registers it as either a code
+asset or an invalid action. **One response binds one model execution**: there
+is no same-tick retry, no endpoint failover on content errors, and no
+validation feedback rewrite (2026-08-21 渲染格式表 §一⑦).
 
 模型每拍的输出在结构上解耦为**两层**（2026-08-17 提案-裁决流水线 §1.0）：
 
-- **裁决层**（调度元指令）：``execute_decision(event_id=…)``，告诉调度器把某条
+- **裁决层**（调度元指令）：``execute_program(program_hash=…)``，告诉调度器把某份
   历史决策事件提交给 Runner 执行。至多一条，可以没有。
 - **动作层**（业务程序代码）：这一拍新写的 Python 代码，当拍一个函数都不跑，
   只作为新事件落库。
@@ -40,7 +42,6 @@ extra tick worth having: the half sentence a human is still typing arrives in it
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -56,26 +57,18 @@ from qqbot.services.agent_loop.decision import (
     DecisionOutput,
     Planner,
 )
-
-# 同拍最多决定次数：每次 preflight 失败冷却当前端点后换组内下一个模型再
-# decide；**不**把被拒源码/校验错误喂回模型（2026-08-11 取消「校验拒绝」纠错环）。
-_DECIDE_MAX_ATTEMPTS = 3
-from qqbot.services.agent_loop.event_writer import (
-    write_agent_event,
-    write_runtime_event,
-)
+from qqbot.services.agent_loop.event_writer import write_runtime_event
 from qqbot.services.agent_loop.program_ast import (
-    PreflightResult,
-    ProgramErrorInfo,
     ProgramPreflightError,
     preflight,
 )
 from qqbot.services.agent_loop.program_events import (
-    load_referenced_decision,
+    load_program_asset,
     recover_interrupted_programs,
     write_program_completed,
     write_program_failed,
 )
+from qqbot.services.agent_loop.program_registrar import register_model_response
 from qqbot.services.agent_loop.program_runner import ProgramRunner, QueuedProgram
 from qqbot.services.agent_loop.program_runtime import (
     ProgramExecutionError,
@@ -106,7 +99,12 @@ _WAKE_BATCH_WINDOW_SECONDS = 3.0
 # 续拍，她可能反复改期或反复记任务自转，守住这条的只有提示词纪律。
 # 2026-08-17 起自续拍的口径扩大：提案拍与裁决报错拍也走它（那两种拍没有后台任务
 # 替它们唤醒），因此一次「提案→裁决→执行→再决策」正常就要吃掉 3 层深度——
-# 配这个 env 时按此估算，别照旧按「一次查询一层」算。上界默认不设。
+# 配这个 env 时按此估算，别照旧按「一次查询一层」算。
+# 2026-08-21 再扩一次：注册层拦下的非法行动同样自续（§一⑦ 回灌被拒源码让模型
+# 重写）。挡住「错→回灌→再错」的是**提示词纪律**——planner.md 要求她连着两条
+# <invalid_action> 就交空程序停下（维护者裁定：约束大模型用提示词，不新造机制；
+# 与 2026-08-04 对 wait 自转的处理同源）。本 env 仍是部署侧兜底，`.env.example`
+# 给了 12 当安全网。
 _CONTINUATION_MAX_ENV = "AGENT_CONTINUATION_MAX_TICKS"
 
 SessionFactory = Callable[[], AsyncSession]
@@ -115,12 +113,16 @@ SessionFactory = Callable[[], AsyncSession]
 def continuation_max_ticks() -> int | None:
     """连续自续拍上界。env ``AGENT_CONTINUATION_MAX_TICKS``。
 
-    未配置 / 空 → ``None``，即**不限制**（当前默认）；``0`` → 关掉自续拍，
-    退回纯事件驱动；``N > 0`` → 一段活动内最多连续自续 N 拍，之后必须等一次
-    真正的外部唤醒。计数被任何外部唤醒清零，因此约束的是「一次自转能有多长」，
-    不是「一小时能跑多少拍」。
+    未配置 / 空 → ``None``，即**不限制**；``0`` → 关掉自续拍，退回纯事件驱动；
+    ``N > 0`` → 一段活动内最多连续自续 N 拍，之后必须等一次真正的外部唤醒。
+    计数被任何外部唤醒清零，因此约束的是「一次自转能有多长」，不是「一小时能
+    跑多少拍」。
 
     留这个旋钮是因为默认无界：真在生产里自转起来时，部署侧不改代码就能收。
+    它是**兜底**不是主闸——同拍静态重试撤销后，一次语法错就是一整拍 + 一次自
+    唤醒 + 一层深度，而挡住「错→回灌→再错」的是 planner.md 里那条纪律（连着
+    两条 ``<invalid_action>`` 就交空程序停下）。系统一侧不替大模型数错误次数：
+    ``<invalid_action>`` 是时间线事实事件，她自己看得见有几条。
     """
     raw = get_env_value(_CONTINUATION_MAX_ENV)
     if raw is None or not str(raw).strip():
@@ -228,8 +230,9 @@ class AgentLoop:
     def _wake_continuation(self) -> bool:
         """本 loop 自己刚落了事实、需要再开一拍。返回是否真的排上。
 
-        两个来源：决策拍自己写完提案 / 裁决报错，以及 Runner 写出 program
-        terminal。**与外部唤醒同一条窗口**（2026-08-17 维护者裁定）：所有落库
+        三个来源：决策拍自己写完提案 / 裁决报错、注册层拦下非法行动（2026-08-21
+        新增，回灌被拒源码让模型重写），以及 Runner 写出 program terminal。
+        **与外部唤醒同一条窗口**（2026-08-17 维护者裁定）：所有落库
         的事件都走 3 秒攒批窗，没有旁路——决策事件和别的事件一样，凭什么它
         引发的那次唤醒可以插队。这三秒不是等待成本，正是人补完后半句的时间，
         跳过它就等于让下一拍照旧看不见新消息。
@@ -336,8 +339,18 @@ class AgentLoop:
                 )
 
         context = await self._build_context(correlation_id, now)
-        decision, prepared, preflight_error = await self._decide_program(context)
-        if decision is None:
+        decision = await self._decide_program(context)
+        if decision is None or decision.planner_error:
+            # 响应根本没到达（网络失败/端点超时/上游拒绝/返回空）。这归模型
+            # 提供层：由它自己重试、换端点、最终放弃，**不进时间线**。本拍
+            # 无输出，仅此而已——尤其不能把它落成一次空程序，那会把一次网络
+            # 故障伪造成"她这拍选择了沉默"（渲染格式表 §一⑦ 失败分层）。
+            if decision is not None:
+                logger.warning(
+                    "[loop {}] planner returned no usable response: {}",
+                    self._scope_key,
+                    decision.planner_error,
+                )
             await self._write_tick_ended(
                 correlation_id,
                 tick_started_id,
@@ -345,77 +358,63 @@ class AgentLoop:
             )
             return
 
-        if prepared is not None:
-            stored_program = prepared.source
-            program_sha256 = prepared.program_sha256
+        # 生产路径：outbound.invoke 已经把响应送进入口网关，适配器做过预检。
+        # Stub planner / 未接线时 decision.event_id 为空，走降级直写。
+        if decision.event_id:
+            from qqbot.services.agent_loop.program_registrar import (
+                RegisteredResponse,
+            )
+
+            registered = RegisteredResponse(
+                event_id=decision.event_id,
+                accepted=bool(decision.accepted),
+                program=decision.program,
+                program_sha256=decision.program_sha256 or "",
+                prepared=decision.prepared,
+                left_asset=decision.left_asset,
+            )
         else:
-            stored_program = _bounded_program_source(decision.program)
-            program_sha256 = _program_sha256(stored_program)
-
-        decision_id = await write_agent_event(
-            self._session_factory,
-            event_type="agent.decision_emitted",
-            scope_key=self._scope_key,
-            correlation_id=correlation_id,
-            causation_id=None,
-            payload={
-                "program": stored_program,
-                "program_sha256": program_sha256,
-                "tick_seq": self._tick_seq,
-            },
-            occurred_at=now,
-        )
-
-        if prepared is None:
-            info = preflight_error or ProgramErrorInfo(
-                "invalid_program_giveup",
-                "program preflight failed after endpoint failover",
+            registered = await register_model_response(
+                self._session_factory,
+                scope_key=self._scope_key,
+                scope=self._scope_key.split(":", 1)[0],
+                correlation_id=correlation_id,
+                raw_program=decision.program,
+                registry=self._tool_registry,
+                tick_seq=self._tick_seq,
+                now=now,
             )
-            details = dict(info.details)
-            if info.line is not None:
-                details["line"] = info.line
-            if info.column is not None:
-                details["column"] = info.column
-            await _shield_write(
-                write_program_failed(
-                    self._session_factory,
-                    scope_key=self._scope_key,
-                    correlation_id=correlation_id,
-                    decision_id=decision_id,
-                    program_sha256=program_sha256,
-                    duration_ms=0,
-                    query_calls=[],
-                    effect_call_ids=[],
-                    error_kind="invalid_program_giveup",
-                    error_message=(
-                        "program remained invalid after endpoint failover: "
-                        f"{info.error_kind}: {info.message}"
-                    ),
-                    failed_call=None,
-                    rejected_error_kind=info.error_kind,
-                    **details,
-                )
-            )
+        if not registered.accepted:
+            # 被拒源码已随 agent.invalid_action 回灌进时间线；本拍没有 decision
+            # root，也不写任何 program terminal。自唤醒让模型看着自己写错的那段
+            # 重写一遍——它**计入** AGENT_CONTINUATION_MAX_TICKS，撤掉同拍重试后
+            # 那个上界是这套自纠正循环唯一的闸。
+            self._wake_continuation()
             await self._write_tick_ended(
                 correlation_id,
                 tick_started_id,
-                program_status="invalid",
+                program_status="invalid_action",
             )
             return
+
+        prepared = registered.prepared
+        assert prepared is not None  # accepted 蕴含 prepared 非空
+        decision_id = registered.event_id
+        program_sha256 = registered.program_sha256
+        left_proposal = registered.left_asset
 
         # 两层各自独立结算（§1.0）：裁决层调度的是**别的**事件，动作层是本拍新写
         # 的代码，同一次输出里可以两者都有，也可以只有一个、一个都没有。
         commit_outcome: str | None = None
-        if prepared.commit_event_id is not None:
-            commit_outcome = await self._commit_decision(
+        if prepared.commit_program_hash is not None:
+            commit_outcome = await self._commit_program(
                 commit_decision_id=decision_id,
                 commit_program_sha256=program_sha256,
-                target_event_id=prepared.commit_event_id,
+                target_program_hash=prepared.commit_program_hash,
                 correlation_id=correlation_id,
                 context=context,
                 now=now,
             )
-        left_proposal = bool(prepared.call_sites or prepared.has_return)
 
         if commit_outcome is None and not left_proposal:
             # 两层都空 = 停止符：当拍收口，**不**唤醒，这段连续运行到此为止。
@@ -452,106 +451,103 @@ class AgentLoop:
             left_proposal=left_proposal,
         )
 
-    async def _commit_decision(  # noqa: PLR0913
+    async def _commit_program(  # noqa: PLR0913
         self,
         *,
         commit_decision_id: str,
         commit_program_sha256: str,
-        target_event_id: str,
+        target_program_hash: str,
         correlation_id: str,
         context: DecisionContext,
         now: datetime,
     ) -> str:
-        """裁决层：把被指名的那条历史决策交给 Runner 真正执行。
+        """裁决层：把被指名的那份**代码资产**交给 Runner 真正执行。
 
-        被引用事件里存的本来就是纯业务代码（preflight 落库前已剥掉裁决层），
-        因此这里重新 preflight 一遍拿到的必然 ``commit_event_id is None``，不存在
+        2026-08-21 起裁决按 ``program_hash`` 寻址：``event_id`` 命名时间线上的
+        历史事实事件，``program_hash`` 命名不可变的代码逻辑资产，两个值域分工
+        明确。``execute_program`` 表达的是"调度执行某段具体的代码资产"，而不是
+        "重新执行当年的某个事件"。
+
+        资产里存的本来就是纯业务代码（preflight 落库前已剥掉裁决层），因此这里
+        重新 preflight 一遍拿到的必然 ``commit_program_hash is None``，不存在
         套娃。
 
-        被执行程序沿用它落库那一拍的 correlation_id：那些 ``tool_called`` /
+        被执行程序沿用资产落库那一拍的 correlation_id：那些 ``tool_called`` /
         terminal 是这段程序的事件，归属它的出处，不归属按下执行键的这一拍。
 
-        成功时本拍**不写**任何 program terminal——终态属于被执行的那段程序。
-        失败按提案 §1.1 写 ``agent.program_failed``，挂在本拍的决策事件上。
-        唤醒由调用方统一处理。
+        **没有 already_executed 守卫**：同源码即同资产，一份资产调度几次跑几次，
+        系统不拦，重复副作用由模型读 ``<program_result>`` 自行判断（任务与决策
+        契约 §1.-1）。派发前只剩 ``program_not_found`` 一条运行期检查。
 
-        已知副作用（实现时向维护者提出）：流水线混合拍里，本拍的决策事件同时
-        承载着动作层新代码；给它扣上 program terminal 会让 ``already_executed``
-        连那段新代码一起判死，模型只能照着时间线重写一遍。
+        成功时本拍**不写**任何 program terminal——终态属于被执行的那段程序，
+        并带上 ``(dispatch_event_id, program_hash)`` 双键：取消守卫后同一份资产
+        可以合法并发跑多次，只凭 hash 分不出是哪一次运行。
+        唤醒由调用方统一处理。
         """
-        decision, error_kind = await load_referenced_decision(
+        asset, error_kind = await load_program_asset(
             self._session_factory,
             scope_key=self._scope_key,
-            event_id=target_event_id,
+            program_hash=target_program_hash,
         )
-        if decision is None:
+        if asset is None:
             await self._reject_commit(
                 decision_id=commit_decision_id,
                 program_sha256=commit_program_sha256,
                 correlation_id=correlation_id,
-                error_kind=error_kind or "decision_not_found",
+                error_kind=error_kind or "program_not_found",
                 error_message=_COMMIT_REJECTION_MESSAGES.get(
                     error_kind or "",
-                    f"cannot execute decision {target_event_id}",
+                    f"cannot execute program {target_program_hash}",
                 ),
-                target_event_id=target_event_id,
+                target_program_hash=target_program_hash,
             )
             return "commit_rejected"
 
         scope = self._scope_key.split(":", 1)[0]
         try:
-            target = preflight(decision.program, self._tool_registry, scope)
+            target = preflight(asset.program, self._tool_registry, scope)
         except ProgramPreflightError as exc:
             # 存量源码现在过不了预检——工具下线、scope 权限变了都会这样。
-            # 报的是被引用程序自己的错，不是裁决语法错。
+            # 报的是被指名程序自己的错，不是裁决语法错。
             await self._reject_commit(
                 decision_id=commit_decision_id,
                 program_sha256=commit_program_sha256,
                 correlation_id=correlation_id,
                 error_kind=exc.info.error_kind,
                 error_message=(
-                    f"referenced decision {target_event_id} no longer passes "
+                    f"program {target_program_hash} no longer passes "
                     f"preflight: {exc.info.message}"
                 ),
-                target_event_id=target_event_id,
-            )
-            return "commit_rejected"
-
-        if not (target.call_sites or target.has_return):
-            # 那条决策的动作层是空的：它只下过一次调度指令，或者本来就是空程序
-            # （空程序在它自己那一拍就收了终态）。没有代码可跑。
-            await self._reject_commit(
-                decision_id=commit_decision_id,
-                program_sha256=commit_program_sha256,
-                correlation_id=correlation_id,
-                error_kind="decision_not_a_proposal",
-                error_message=_COMMIT_REJECTION_MESSAGES["decision_not_a_proposal"],
-                target_event_id=target_event_id,
+                target_program_hash=target_program_hash,
             )
             return "commit_rejected"
 
         try:
             self._runner.enqueue(
                 QueuedProgram(
-                    decision_id=decision.event_id,
+                    decision_id=asset.event_id,
                     scope_key=self._scope_key,
-                    correlation_id=decision.correlation_id or correlation_id,
+                    correlation_id=asset.correlation_id or correlation_id,
                     prepared=target,
                     context=context,
                     enqueued_at=now,
+                    dispatch_event_id=commit_decision_id,
                 )
             )
         except Exception as exc:
             logger.exception("[loop {}] enqueue failed: {}", self._scope_key, exc)
-            # 这一条终态写在**被执行**的那条决策上，而不是本拍：它这次真的没跑
-            # 成，模型必须重写一段新的，不该再被指名。
+            # 这一条终态写在**资产落库**的那条决策上，而不是本拍：这次派发真的
+            # 没成，带上双键让模型看得出是哪一次调度失败的。资产本身仍在库里，
+            # 可以再次指名——取消 already_executed 后终态不阻止重新调度。
             await _shield_write(
                 write_program_failed(
                     self._session_factory,
                     scope_key=self._scope_key,
-                    correlation_id=decision.correlation_id or correlation_id,
-                    decision_id=decision.event_id,
+                    correlation_id=asset.correlation_id or correlation_id,
+                    decision_id=asset.event_id,
                     program_sha256=target.program_sha256,
+                    program_hash=asset.program_hash,
+                    dispatch_event_id=commit_decision_id,
                     duration_ms=0,
                     query_calls=[],
                     effect_call_ids=[],
@@ -570,9 +566,18 @@ class AgentLoop:
         correlation_id: str,
         error_kind: str,
         error_message: str,
-        target_event_id: str,
+        target_program_hash: str,
     ) -> None:
-        """裁决被拒：本拍写 ``agent.program_failed``（提案 §1.1）。"""
+        """裁决被拒：本拍写 ``agent.program_failed``（提案 §1.1）。
+
+        附 ``target_program_hash=`` 而不是 ``target_event_id=``（2026-08-21）：
+        裁决指向的是代码资产，不是历史事件。
+
+        这条终态扣在**本拍**的决策事件上；④ 混合拍里本拍同时承载动作层新代码。
+        2026-08-17 曾登记过一条已知副作用——``already_executed`` 会因此把那段
+        新代码一起判死。守卫取消后该因果链断裂：终态扣在哪个事件上都不再影响
+        任何资产能否被调度（待办 #21 随之关闭）。
+        """
         await _shield_write(
             write_program_failed(
                 self._session_factory,
@@ -585,7 +590,7 @@ class AgentLoop:
                 effect_call_ids=[],
                 error_kind=error_kind,
                 error_message=error_message,
-                target_event_id=target_event_id,
+                target_program_hash=target_program_hash,
             )
         )
 
@@ -632,64 +637,22 @@ class AgentLoop:
     async def _decide_program(
         self,
         context: DecisionContext,
-    ) -> tuple[
-        DecisionOutput | None,
-        PreflightResult | None,
-        ProgramErrorInfo | None,
-    ]:
-        """decide → preflight；失败只冷却端点并换模型再 decide，不喂校验拒绝。"""
-        last_decision: DecisionOutput | None = None
-        last_error: ProgramErrorInfo | None = None
-        scope = self._scope_key.split(":", 1)[0]
-        for attempt in range(1, _DECIDE_MAX_ATTEMPTS + 1):
-            try:
-                last_decision = await self._planner.decide(context)
-            except Exception as exc:
-                logger.exception(
-                    "[loop {}] planner failed: {}", self._scope_key, exc
-                )
-                return None, None, None
-            try:
-                prepared = preflight(
-                    last_decision.program,
-                    self._tool_registry,
-                    scope,
-                )
-            except ProgramPreflightError as exc:
-                last_error = exc.info
-                reason = f"{exc.info.error_kind}:{exc.info.message}"
-                self._report_invalid_output(reason)
-                await write_runtime_event(
-                    self._session_factory,
-                    event_type="runtime.llm_invalid_output",
-                    scope_key=self._scope_key,
-                    visibility="agent_visible",
-                    correlation_id=context.correlation_id,
-                    causation_id=None,
-                    payload={
-                        "attempt": attempt,
-                        "error_kind": exc.info.error_kind,
-                        "error_message": exc.info.message,
-                        "line": exc.info.line,
-                        "column": exc.info.column,
-                    },
-                )
-                continue
-            return last_decision, prepared, None
-        return last_decision, None, last_error
+    ) -> DecisionOutput | None:
+        """问一次模型，返回它这一次的响应。**只问一次。**
 
-    def _report_invalid_output(self, reason: str) -> None:
-        report = getattr(self._planner, "report_invalid_output", None)
-        if not callable(report):
-            return
+        2026-08-21（渲染格式表 §一⑦）删掉了同拍三次静态重试链路：校验不再在
+        这里发生，preflight 归注册层（``program_registrar``），而"一个响应绑定
+        一次模型执行"意味着内容有误时不换端点重生成——那不是端点的错，冷却它
+        既无益也不诚实（旧的 ``report_invalid_output`` 调用点随之撤销）。
+
+        返回 ``None`` 只代表 Planner 自身抛了异常；传输类失败由 Planner 填
+        ``planner_error`` 表达。两者都归模型提供层，都不进时间线。
+        """
         try:
-            report(reason)
+            return await self._planner.decide(context)
         except Exception as exc:
-            logger.warning(
-                "[loop {}] invalid-output route report failed: {}",
-                self._scope_key,
-                exc,
-            )
+            logger.exception("[loop {}] planner failed: {}", self._scope_key, exc)
+            return None
 
     async def _run_queued_program(self, item: QueuedProgram) -> None:
         """Runner 回调：顺序执行一段已 preflight 的程序并写 program terminal。"""
@@ -724,6 +687,8 @@ class AgentLoop:
                     correlation_id=item.correlation_id,
                     decision_id=item.decision_id,
                     program_sha256=prepared.program_sha256,
+                    program_hash=prepared.program_hash,
+                    dispatch_event_id=item.dispatch_event_id,
                     duration_ms=trace.duration_ms,
                     query_calls=list(trace.query_calls),
                     effect_call_ids=list(trace.effect_call_ids),
@@ -745,6 +710,8 @@ class AgentLoop:
                     correlation_id=item.correlation_id,
                     decision_id=item.decision_id,
                     program_sha256=prepared.program_sha256,
+                    program_hash=prepared.program_hash,
+                    dispatch_event_id=item.dispatch_event_id,
                     duration_ms=0,
                     query_calls=[],
                     effect_call_ids=[],
@@ -761,6 +728,8 @@ class AgentLoop:
                 correlation_id=item.correlation_id,
                 decision_id=item.decision_id,
                 program_sha256=prepared.program_sha256,
+                program_hash=prepared.program_hash,
+                dispatch_event_id=item.dispatch_event_id,
                 duration_ms=result.trace.duration_ms,
                 query_calls=list(result.trace.query_calls),
                 effect_call_ids=list(result.trace.effect_call_ids),
@@ -793,33 +762,14 @@ class AgentLoop:
         )
 
 
-# 裁决失败的说明文本。它会作为 ``<程序>失败`` 的「原因」行进入信封，是模型
-# 唯一能看到的纠正依据——写成让人一眼知道下一步该干什么的话。
+# 裁决失败的说明文本。它会作为 ``<program_result> status:failed`` 的 ``reason:``
+# 行进入信封，是模型唯一能看到的纠正依据——写成让人一眼知道下一步该干什么的话。
 _COMMIT_REJECTION_MESSAGES = {
-    "decision_not_found": (
-        "no such decision in this scope; copy the id from a <程序>决策 row's "
-        "ev: prefix in the current timeline"
-    ),
-    "already_executed": (
-        "that decision is already running or has already finished; write a new "
-        "program instead of running the same one twice"
-    ),
-    "decision_not_a_proposal": (
-        "that decision has no program body to run (it only carried a scheduling "
-        "directive, or it was an empty program that already closed)"
+    "program_not_found": (
+        "no such program in this scope; copy the 12-hex hash from a program row "
+        "in the current timeline"
     ),
 }
-
-
-def _bounded_program_source(value: Any) -> str:
-    from qqbot.services.agent_loop.program_ast import MAX_SOURCE_CHARS
-
-    source = value if isinstance(value, str) else str(value)
-    return source[:MAX_SOURCE_CHARS]
-
-
-def _program_sha256(source: str) -> str:
-    return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
 async def _shield_write(awaitable: Any) -> None:

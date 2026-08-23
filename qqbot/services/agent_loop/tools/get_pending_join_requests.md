@@ -46,7 +46,7 @@
 
 本工具的结果不包含 `request_event_id`。审批操作
 `respond_to_group_join_request` 使用时间线
-`<加群申请>` 行的 `ev:` 值。没有对应时间线事件的申请
+`<join_request>` 行的 `ev:` 值。没有对应时间线事件的申请
 不能通过该审批工具处理。
 
 上游响应结构无法识别时返回 `upstream_payload_invalid`；OneBot 调用失败时

@@ -31,7 +31,6 @@ import hashlib
 import time
 from typing import Any
 
-from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.image_utils import normalize_image_for_llm
 from qqbot.services.agent_loop.prompt_snapshot import (
@@ -56,9 +55,9 @@ MAX_DESCRIPTION_CHARS = 600
 # 理由见本模块 docstring）。required 段：文件缺失/为空时上抛，caption_image
 # 折成 CaptionError（收藏失败、不落表），不静默用空指令看图。
 def _load_caption_prompt() -> str:
-    from qqbot.services.agent_loop.prompts.catalog import render_system_prompt
+    from qqbot.services.prompt_assembler import assemble
 
-    return render_system_prompt("caption")
+    return assemble("caption")
 
 class CaptionError(RuntimeError):
     """caption 生成失败（LLM 未配置 / 调用异常 / 空输出）。"""
@@ -69,9 +68,7 @@ async def caption_image(
 ) -> str:
     """看图生成收藏描述。失败一律 raise CaptionError（见模块 docstring）。
 
-    与 llm_planner 同一个 create_llm 入口，走 role="caption" 路由；
-    视觉模型由配置里的组 / role 目标选定（不再用 capabilities 硬过滤）。
-    每次调用新建包装对象 —— 收藏是低频动作，底层客户端由 llm 层缓存。
+    走出口网关 ``invoke(scene=caption)``（role=caption 路由）。
     """
     try:
         image_bytes, mime = normalize_image_for_llm(image_bytes, mime or "image/png")
@@ -80,17 +77,9 @@ async def caption_image(
             f"caption image conversion failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    # 温度在 caption 这条 role 指向的**端点**上配（2026-08-14 起采样参数只在
-    # providers[].models[] 上声明）。建议低温 0.2：同一张图的描述应当稳定，
-    # 不需要发散。见 LLM 路由契约 §2。
-    llm = await create_llm(role="caption")
-    if llm is None:
-        raise CaptionError(
-            "caption LLM not configured "
-            "(config/model_providers.json 缺失，或 caption role 无候选)"
-        )
-
     from langchain_core.messages import HumanMessage
+
+    from qqbot.services.event_gateway.outbound import invoke
 
     try:
         prompt = _load_caption_prompt()
@@ -119,8 +108,7 @@ async def caption_image(
     if should_snapshot(None):
         snapshot = PromptSnapshot(
             kind="meme_caption",
-            model=getattr(llm, "model_name", None)
-            or getattr(llm, "model", None),
+            model=None,
             user_text=prompt,
             images=[
                 {
@@ -131,28 +119,30 @@ async def caption_image(
             ],
         )
     started = time.monotonic()
-    try:
-        raw = await llm.ainvoke([message])
-    except Exception as exc:
-        if snapshot is not None:
-            snapshot.add_attempt(
-                latency_ms=int((time.monotonic() - started) * 1000),
-                error=f"{type(exc).__name__}: {exc}"[:300],
-            )
-            snapshot.outcome = "call_error"
-            write_snapshot(snapshot)
-        raise CaptionError(
-            f"caption LLM call failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    text = _extract_text(raw).strip()
+    invoked = await invoke("caption", [message])
     if snapshot is not None:
         snapshot.add_attempt(
             latency_ms=int((time.monotonic() - started) * 1000),
-            response_text=text,
-            usage=extract_usage(raw),
+            response_text=invoked.text,
+            usage=extract_usage(invoked.raw),
+            error=invoked.error,
         )
-        snapshot.outcome = "ok" if text else "empty_response"
+        snapshot.outcome = (
+            "call_error"
+            if not invoked.ok
+            else ("ok" if invoked.text.strip() else "empty_response")
+        )
         write_snapshot(snapshot)
+    if not invoked.ok:
+        if invoked.error == "llm_unavailable":
+            raise CaptionError(
+                "caption LLM not configured "
+                "(config/model_providers.json 缺失，或 caption role 无候选)"
+            )
+        raise CaptionError(
+            f"caption LLM call failed: {invoked.error}"
+        )
+    text = invoked.text.strip()
     if not text:
         raise CaptionError("caption LLM returned empty text")
     return text[:MAX_DESCRIPTION_CHARS]

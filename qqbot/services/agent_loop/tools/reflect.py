@@ -21,9 +21,14 @@ create/note/complete/fail 的生命周期，写进程序注释则当拍即焚。
 拿当期事实重新审视。频率是那个病理的开关，这三条把它压在最弱形态。
 
 存储：``agent.reflection_written`` 领域事件，经 ``ToolGeneratedEvent`` 随工具
-terminal 同事务落库（程序执行黑盒设计 §Effect 两段事务）。投影只认最新一条，
-折叠进 ``DecisionContext.reflection`` 并渲染成信封 `## 反思` 一节；该事件本身在
-timeline 里消隐，避免同一段文字两处渲染。
+terminal 同事务落库（程序执行黑盒设计 §Effect 两段事务）。
+
+2026-08-21 起它是**时间线事实事件**：渲染成 ``<reflection>`` 行逐版留痕，不再折叠成
+`## 反思` 一节、也不再被后来的版本覆写。全量覆写会让历史各版彻底消失，模型
+因此看不到自己认识的演变。
+
+腾出的 latest-wins 折叠器已交给 task 便签（渲染格式表 §一②）：
+分工是"反思要历史、便签只要现状"。
 
 依赖注入：无。本工具不读库、不调 napcat——它只把文本交给执行层落库，
 scope/correlation/causation 全由 ProgramExecutor 统一接。
@@ -63,9 +68,10 @@ class ReflectTool(BaseTool):
     program_kind = "effect"
     max_call_sites = 1
     description = (
-        "写下当前这一版自我认识，完整替换上一版。文本会作为 "
-        f"`## 反思` 一节持续出现在后续每一拍的输入里，上限 "
-        f"{MAX_REFLECTION_CHARS} 字。本工具不发送任何消息，也不改变群内状态。"
+        "写下当前这一版自我认识。文本会作为一条 `<reflection>` 落在时间线上，"
+        "和别的事一样按时刻留在流里；此前各版都还在，不会被这一版抹掉。"
+        f"上限 {MAX_REFLECTION_CHARS} 字。"
+        "本工具不发送任何消息，也不改变群内状态。"
     )
     usage_prompt = _USAGE_PROMPT
     arguments_schema = {

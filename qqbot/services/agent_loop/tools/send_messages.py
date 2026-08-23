@@ -3,15 +3,15 @@
 2026-08-17 删除 `reply` / ReplyTask 后，"想好的话不会当拍就出去"不再靠提示词
 纪律，而由提案-裁决流水线在结构上保证：写下 `send_messages(...)` 的那一拍只把
 源码落成一条决策事件，谁都没被调用；要等下一拍重新读完时间线、写
-``execute_decision(event_id=…)`` 指名它，气泡才真的发得出去。人打字要花的那段
+``execute_program(program_hash=…)`` 指名它，气泡才真的发得出去。人打字要花的那段
 时间，就是这两拍之间模型重新看世界的那一眼。
 
 本工具自己**始终可调用**，不检查任何前置状态——它是一个普通 Program Effect：
 执行器先写 ``agent.tool_called`` 意图，再调用本工具，最后把结构化 receipts 写进
 ``agent.tool_result | tool_failed``。它不新增 fence / finalizer。若 OneBot 已出手
 但 terminal 尚未写成时进程退出，启动收口器会把半截调用标成 ``interrupted`` /
-``uncertain``，**永不自动重放**。其 `<工具>send_messages` 行块（气泡 + 回执）就是
-时间线上的唯一发言记录；不再派生第二条发言行，`<旧发言>` 只兼容历史链路。
+``uncertain``，**永不自动重放**。其 `<tool>send_messages` 行块（气泡 + 回执）就是
+时间线上的唯一发言记录；不再派生第二条发言行，`<legacy_reply>` 只兼容历史链路。
 
 结果语义（status 随 receipts 一起落 terminal payload）：
 
@@ -69,8 +69,10 @@ _CHAT_BUBBLE_SCHEMA = {
         "reply": {
             "type": ["string", "integer"],
             "description": (
-                "可选：被引用消息的 ID，取时间线 #消息ID 记号里的号原样照抄。"
-                "引用只作用于本条气泡。"
+                "可选：被引用消息的 ID。普通发言默认不填；仅在群聊多话题"
+                "并行、需要明确指着某一条具体历史消息说话以消除歧义时，"
+                "才取时间线 #消息ID 记号里的号原样照抄。引用只作用于本条"
+                "气泡。"
             ),
         },
         "at": {

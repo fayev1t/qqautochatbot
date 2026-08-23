@@ -30,7 +30,6 @@ from typing import Any, Awaitable, Callable, Iterator
 from sqlalchemy import and_, or_, select
 
 from qqbot.core.ids import new_event_id
-from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
 from qqbot.core.settings import get_env_value
 from qqbot.core.time import china_now, normalize_china_time
@@ -262,7 +261,7 @@ def _extract_text(message: Any) -> str:
 class MemoryCompactor:
     """每 scope 互斥的滚动摘要压缩器（group scope 专属）。
 
-    依赖注入：``session_factory``（同 task_store 惯例）与 ``llm_factory``
+    依赖注入：``session_factory``（每次新开独立事务）与 ``llm_factory``
     （缺省 ``create_llm(role="memory")``，路由未配置该 role 时回落 default，
     见 LLM 路由契约 §3）——契约测试全离线跑。"""
 
@@ -273,7 +272,8 @@ class MemoryCompactor:
         llm_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self._session_factory = session_factory
-        self._llm_factory = llm_factory or (lambda: create_llm(role="memory"))
+        # None = 走出口网关 invoke；测试注入 factory 则本地 ainvoke。
+        self._llm_factory = llm_factory
         # 灰度白名单构造时读定（None=不限制）；改 env 需重启（同阈值）。
         self._scope_allowlist = load_scope_allowlist()
         self._trigger_events = CompactionConfig.load().trigger_events
@@ -383,13 +383,16 @@ class MemoryCompactor:
         if not snaps:
             return CompactionOutcome(scope_key, 0, (), "empty_slice")
         rendered = self._render_slice(scope_key, snaps, now)
-        llm = await self._llm_factory()
-        if llm is None:
-            logger.warning(
-                "[memory] {} LLM 未配置（role=memory 且无 default 候选）",
-                scope_key,
-            )
-            return CompactionOutcome(scope_key, 0, (), "llm_unavailable")
+        if self._llm_factory is None:
+            llm = None
+        else:
+            llm = await self._llm_factory()
+            if llm is None:
+                logger.warning(
+                    "[memory] {} LLM 未配置（role=memory 且无 default 候选）",
+                    scope_key,
+                )
+                return CompactionOutcome(scope_key, 0, (), "llm_unavailable")
         result = await self._summarize(
             scope_key=scope_key,
             llm=llm,
@@ -579,11 +582,9 @@ class MemoryCompactor:
         return "\n".join(render_timeline_stream(ctx.timeline))
 
     def _load_system_prompt(self) -> str:
-        from qqbot.services.agent_loop.prompts.catalog import (
-            render_system_prompt,
-        )
+        from qqbot.services.prompt_assembler import assemble
 
-        return render_system_prompt("memory")
+        return assemble("memory")
 
     # ─── LLM 折叠 ───
 
@@ -678,7 +679,19 @@ class MemoryCompactor:
             )
         started = time.monotonic()
         try:
-            raw = await llm.ainvoke(messages)
+            if llm is None:
+                from qqbot.services.event_gateway.outbound import invoke
+
+                invoked = await invoke(
+                    "memory", messages, extra={"scope_key": scope_key}
+                )
+                if not invoked.ok:
+                    raise RuntimeError(invoked.error or "llm_unavailable")
+                raw = invoked.raw
+                text = invoked.text.strip()
+            else:
+                raw = await llm.ainvoke(messages)
+                text = _extract_text(raw).strip()
         except Exception as exc:
             logger.warning(
                 "[memory] {} LLM 调用失败: {}: {}",
@@ -694,7 +707,6 @@ class MemoryCompactor:
                 snapshot.outcome = "call_error"
                 write_snapshot(snapshot)
             return None
-        text = _extract_text(raw).strip()
         parsed = parse_compaction_output(text)
         if snapshot is not None:
             snapshot.add_attempt(

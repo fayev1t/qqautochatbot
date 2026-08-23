@@ -4,7 +4,7 @@
 
 `respond_to_group_join_request` 审批当前群的一条入群申请，对应 OneBot V11
 `set_group_add_request`。目标申请必须已作为
-`<加群申请>ev:...` 行出现在当前群时间线中。
+`<join_request>ev:...` 行出现在当前群时间线中。
 
 该工具不处理好友申请或机器人入群邀请。
 

@@ -70,26 +70,30 @@ def build_default_registry() -> ToolRegistry:
     # 即可，无需改别处。（respond_to_request 已于 2026-07-03 拆分删除，见下。）
     registry = ToolRegistry()
     # ── 基础能力（当前在用）──
-    # task：跨 tick 任务生命周期。它是普通 Program Effect；create 返回的
-    # task_id 可直接存在程序变量里，供同拍后续 effect 的 task_id= 参数使用。
+    # task：单栏待办便签（2026-08-21 起）。整段覆写，空串清空；折成信封顶部的
+    # <task> 单栏，不进时间线。旧的 create/note/complete/fail 状态机、task_id
+    # 值域与 agent_tasks 读模型表已一并删除，不要恢复。
     registry.register(TaskTool)
     # send_messages：出站发言。2026-08-17 删除 reply/ReplyTask 后它不再是
     # "两步发言的第二步"——"想好的话不会当拍就出去"已由提案-裁决流水线在结构
     # 上保证：写下 send_messages 的那一拍只把源码落库，要等下一拍重新读完
-    # 时间线、写 execute_decision 指名它，气泡才真的发得出去。发送事实与时间线
+    # 时间线、写 execute_program 指名它，气泡才真的发得出去。发送事实与时间线
     # 记录 = 它自己的 tool terminal receipts（调用行即发言记录，不派生
     # <my-reply>），见 send_messages.py docstring。
     registry.register(SendMessagesTool)
     # wait：模型的时间自主权（自我延迟唤醒），2026-07-02 新增。2026-08-03 起
     # note 必填、上界 6000 秒，同时承担"给自己的回想改期"。
     registry.register(WaitTool)
-    # reflect：第二个跨拍连续装置（2026-08-03）。任务承载未竟之事、有收束
-    # 条件；反思承载对自己的认识、只被后来的版本改写。latest-wins 全量替换，
-    # 渲染成信封 `## 反思` 一节。与 2026-08-01 删除的 <my-thought> 逐拍回显
-    # 的区别（低频 / 全量替换 / 有上限）见 reflect.py docstring。
+    # reflect：第二个跨拍连续装置（2026-08-03；2026-08-21 时间线化）。任务
+    # 承载未竟之事、有收束条件；反思承载对自己的认识、逐版留在时间线上，
+    # 后写的不抹掉先写的，渲染成 <reflection> 行。与 2026-08-01 删除的
+    # <my-thought> 逐拍回显的区别（低频 / 有上限 / 是结论不是笔记）见
+    # reflect.py docstring。
+    # 待办：任务坍缩为单栏便签后（渲染格式表 §一②），这条分工描述要改成
+    # "反思要历史、便签只要现状"，届时 latest-wins 折叠器归便签。
     registry.register(ReflectTool)
     # get_recent_thoughts：跨多拍抽取程序注释。2026-08-14 起当拍源码已在
-    # <程序>决策 里，本工具不再承担找回上一拍程序的兜底。
+    # <action> 里，本工具不再承担找回上一拍程序的兜底。
     registry.register(GetRecentThoughtsTool)
     # 入群申请审批（2026-07-03 拆分自已删除的 respond_to_request）：group.add
     # 事件进目标群 timeline，管理员明确授权后由群内 LLM 调它回执；好友申请 /

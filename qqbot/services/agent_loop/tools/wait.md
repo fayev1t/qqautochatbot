@@ -3,11 +3,11 @@
 ## 功能
 
 `wait` 在指定秒数后为当前 scope 安排一次唤醒。调用立即返回；计时器到期后，
-系统写入 `runtime.wait_elapsed` 事件，在时间线中渲染为 `<系统>wait_elapsed`
+系统写入 `runtime.wait_elapsed` 事件，在时间线中渲染为 `<system>wait_elapsed`
 行并携带 `note` 原文，随后启动一个新 tick。
 
 用于自我提醒与延迟执行其它动作，其中一个具体用途是给自己的回想改期：系统在
-群里静默满阈值时会落 `<系统>silence_elapsed` 并叫醒一次，本工具是在此之外按
+群里静默满阈值时会落 `<system>silence_elapsed` 并叫醒一次，本工具是在此之外按
 当前处境自行约定的那一次。
 
 ## 参数

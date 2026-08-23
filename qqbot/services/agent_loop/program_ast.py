@@ -54,28 +54,48 @@ _SHELL_NAME = "__program_main__"
 _SHELL_INDENT = "    "
 _MIN_FENCED_LINE_COUNT = 2
 _FENCE_OPEN = re.compile(r"^```(?:python)?[ \t]*$", re.IGNORECASE)
-_RESERVED_EFFECT_ARGUMENTS = frozenset({"task_id", "triggered_by_event_id"})
+# Effect 调用的系统保留具名参数：不在工具 arguments_schema 里，由执行层截下来
+# 当挂靠锚，不进 arguments。
+# 2026-08-21 起只剩 ``triggered_by_event_id`` —— ``task_id`` 随任务坍缩为单栏
+# 便签一并消失（渲染格式表 §一②）。这不只是少一个参数：它同时抽掉了敏感工具
+# 发起人权限反查的**回退路径**（原先"调用挂在任务上就沿用任务起因"），因此
+# ``triggered_by_event_id=`` 从"通常可省"变成敏感工具**必须显式传**。
+# 见 planner.md 与各敏感工具 md。
+_RESERVED_EFFECT_ARGUMENTS = frozenset({"triggered_by_event_id"})
 _SCHEMA_ORIGIN_KEY = "x-program-function"
 
-# 裁决层的调度元指令（2026-08-17 提案-裁决流水线 §1.0）。模型每拍的输出解耦为
-# 两层：**裁决层**一行 ``execute_decision``，告诉调度器"把历史事件 X 提交给
-# Runner 执行"；**动作层**才是这一拍新写的业务代码。两层完全正交，一次输出里
-# 可以两者都有——那正是流水线形态：确认上一段的同时写下一段。
+# 裁决层的调度元指令（2026-08-17 提案-裁决流水线 §1.0；2026-08-21 改为资产
+# 寻址）。模型每拍的输出解耦为两层：**裁决层**一行 ``execute_program``，告诉
+# 调度器"把代码资产 H 提交给 Runner 执行"；**动作层**才是这一拍新写的业务代码。
+# 两层完全正交，一次输出里可以两者都有——那正是流水线形态：确认上一段的同时
+# 写下一段。
+#
+# **两个值域分工**（2026-08-21）：``event_id`` 命名的是时间线上的**历史事实
+# 事件（Event）**；``program_hash`` = ``sha256(源码)[:12]``，命名的是**不可变的
+# 代码逻辑资产（Program Object）**。``execute_program`` 表达的是"调度执行某段
+# 具体的代码资产"，而不是"重新执行当年的某个事件"，因此它消费的是 hash 不是
+# 事件 ID。哈希**不掺 occurred_at 或任何时间戳**——掺了它就不再是内容指纹而是
+# 一个 ID，与它要表达的资产语义自相矛盾。
+#
+# 同源码必然同 hash，这是内容寻址的应有之义，不是缺陷：同一份资产可以反复调度，
+# 调度几次跑几次，系统不拦（``already_executed`` 守卫已于 2026-08-21 取消）。
 #
 # 它不是 Program API 工具：registry 里没有它，不占调用点，ProgramExecutor 永远
 # 见不到它。**落库解耦（防套娃）**：preflight 在这里就把指令行从源码里剥掉，
 # ``PreflightResult.source`` 与 ``program_sha256`` 都只覆盖剩下的纯业务代码，
 # 因此 ``decision_emitted.payload.program`` 里绝不会再嵌一条裁决指令；指令本身
-# 化为 ``commit_event_id``，由 AgentLoop 在派发处消费。
+# 化为 ``commit_program_hash``，由 AgentLoop 在派发处消费。
 #
-# 形状必须在静态期锁死：模块顶层的独立语句、唯一具名参数、字面量事件 ID。写在
+# 形状必须在静态期锁死：模块顶层的独立语句、唯一具名参数、字面量 hash。写在
 # 表达式里（赋值右侧、当参数、放进 if 条件）一律拒绝——那会让"这一拍要不要执行
-# 某条历史决策"变成运行期才知道的事。
-_COMMIT_FUNCTION_NAME = "execute_decision"
+# 某段代码"变成运行期才知道的事。
+_COMMIT_FUNCTION_NAME = "execute_program"
 _COMMIT_MAX_CALL_SITES = 1
+# 12 位小写十六进制：sha256 摘要的展示前缀，与图片 file_hash、meme hash 同构。
+_PROGRAM_HASH_PATTERN = re.compile(r"[0-9a-f]{12}")
+PROGRAM_HASH_CHARS = 12
 # 事件 ID = 26 位 Crockford base32 ULID（core/ids.new_event_id）。信封里带
 # ``ev:`` 前缀展示，实参取裸值。
-_EVENT_ID_PATTERN = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
 
 
 @dataclass(frozen=True)
@@ -122,12 +142,22 @@ class PreflightResult:
     tree: ast.Module = field(repr=False, compare=False)
     call_sites: tuple[ProgramCallSite, ...] = ()
     has_return: bool = False
-    # 裁决层：非 None 表示本拍还带了一条调度元指令，值是被引用的历史决策事件
-    # ID。它与动作层（source / call_sites / has_return）互不相干，可以同时存在；
-    # ``source`` 里**已经剥掉**了这条指令。
-    commit_event_id: str | None = None
+    # 裁决层：非 None 表示本拍还带了一条调度元指令，值是被指名的**代码资产
+    # hash**（不是事件 ID）。它与动作层（source / call_sites / has_return）互不
+    # 相干，可以同时存在；``source`` 里**已经剥掉**了这条指令。
+    commit_program_hash: str | None = None
     # 指令在**原始**响应里占的物理行范围，只在 preflight 内部用于剥离。
     commit_lines: tuple[int, int] | None = field(default=None, compare=False)
+
+    @property
+    def program_hash(self) -> str:
+        """本段源码作为**代码资产**的身份：``program_sha256`` 的 12 位前缀。
+
+        与 ``event_id`` 分属两个值域，不可互推：``event_id`` 命名时间线上的
+        历史事实事件，本值命名不可变的代码逻辑资产。同源码必然同 hash——这是
+        内容寻址的应有之义，``execute_program`` 据此反复调度同一份资产。
+        """
+        return self.program_sha256[:PROGRAM_HASH_CHARS]
 
 
 def strip_outer_fence(raw: str) -> str:
@@ -194,13 +224,13 @@ def preflight(
     """
     cleaned = strip_outer_fence(source)
     result = _preflight_source(cleaned, registry, scope)
-    if result.commit_event_id is None or result.commit_lines is None:
+    if result.commit_program_hash is None or result.commit_lines is None:
         return result
     body = _strip_lines(cleaned, result.commit_lines)
     stripped = _preflight_source(body, registry, scope)
     return replace(
         stripped,
-        commit_event_id=result.commit_event_id,
+        commit_program_hash=result.commit_program_hash,
         commit_lines=result.commit_lines,
     )
 
@@ -248,7 +278,7 @@ def _preflight_source(
         tree=tree,
         call_sites=tuple(validator.call_sites),
         has_return=validator.return_count == 1,
-        commit_event_id=validator.commit_event_id,
+        commit_program_hash=validator.commit_program_hash,
         commit_lines=validator.commit_lines,
     )
 
@@ -373,7 +403,7 @@ class _Validator:
         self._visible = {spec.name: spec for spec in registry.specs(scope)}
         self.call_sites: list[ProgramCallSite] = []
         self.return_count = 0
-        self.commit_event_id: str | None = None
+        self.commit_program_hash: str | None = None
         self.commit_lines: tuple[int, int] | None = None
         self._call_occurrences: dict[str, int] = {}
         self._effect_counts: dict[str, int] = {}
@@ -943,44 +973,45 @@ class _Validator:
                 )
 
     def _commit(self, node: ast.Call, *, top_level: bool) -> None:
-        """``execute_decision(event_id="…")`` 的静态形状。
+        """``execute_program(program_hash="…")`` 的静态形状。
 
-        只在模块顶层、作为独立语句成立。参数唯一且必须是字面量事件 ID——运行期
-        不去解析变量，"这一拍要执行哪条历史决策"必须在派发之前就是确定的。
+        只在模块顶层、作为独立语句成立。参数唯一且必须是 12 位 hex 字面量
+        ``program_hash``——运行期不去解析变量，"这一拍要执行哪段代码"必须在
+        派发之前就是确定的。
         """
         if not top_level:
             self._forbidden(node, "commit_not_top_level")
         if node.args:
             self._forbidden(node, "program_function_positional_args")
         keywords = {keyword.arg: keyword.value for keyword in node.keywords}
-        if len(node.keywords) != 1 or set(keywords) != {"event_id"}:
+        if len(node.keywords) != 1 or set(keywords) != {"program_hash"}:
             self._error(
                 node,
                 "program_forbidden_construct",
                 f"{_COMMIT_FUNCTION_NAME} takes exactly one keyword argument: "
-                'event_id="<事件ID>"',
+                'program_hash="<12位哈希>"',
                 construct="commit_signature",
                 function=_COMMIT_FUNCTION_NAME,
             )
-        value = keywords["event_id"]
+        value = keywords["program_hash"]
         if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
             self._error(
                 value,
                 "program_forbidden_construct",
-                f"{_COMMIT_FUNCTION_NAME} event_id must be a string literal",
-                construct="commit_event_id_not_literal",
+                f"{_COMMIT_FUNCTION_NAME} program_hash must be a string literal",
+                construct="commit_program_hash_not_literal",
                 function=_COMMIT_FUNCTION_NAME,
             )
         text = value.value
-        if _EVENT_ID_PATTERN.fullmatch(text) is None:
+        if _PROGRAM_HASH_PATTERN.fullmatch(text) is None:
             self._error(
                 value,
                 "program_forbidden_construct",
-                f"{_COMMIT_FUNCTION_NAME} event_id must be a 26-character event id "
-                "copied from the timeline without its ev: prefix",
-                construct="commit_event_id_malformed",
+                f"{_COMMIT_FUNCTION_NAME} program_hash must be the 12-hex code "
+                "asset hash copied from a program row in the timeline",
+                construct="commit_program_hash_malformed",
                 function=_COMMIT_FUNCTION_NAME,
-                event_id=text[:64],
+                program_hash=text[:64],
             )
         self._commit_count += 1
         if self._commit_count > _COMMIT_MAX_CALL_SITES:
@@ -990,7 +1021,7 @@ class _Validator:
                 self._commit_count,
                 _COMMIT_MAX_CALL_SITES,
             )
-        self.commit_event_id = text
+        self.commit_program_hash = text
         # 物理行范围（含首尾），供 preflight 从源码里剥掉这一层。函数壳占一行，
         # 因此 AST 行号比模型源码大 1。
         self.commit_lines = (

@@ -12,16 +12,11 @@ class DecisionOutput:
     program: str
     raw_response: str | None = None
     planner_error: str | None = None
-
-
-@dataclass(frozen=True)
-class ProgramValidationFeedback:
-    attempt: int
-    error_kind: str
-    message: str
-    rejected_program: str
-    line: int | None = None
-    column: int | None = None
+    event_id: str | None = None
+    accepted: bool | None = None
+    prepared: Any = None
+    left_asset: bool = False
+    program_sha256: str | None = None
 
 
 # ─── Projection-fed view dataclasses (任务与决策契约 §2.1、§8) ───
@@ -55,7 +50,7 @@ class MemeView:
     llm_planner 渲染成信封 `## 表情包收藏` 一节里的一行
     ``<meme>hash12 (MM-DD): 描述``。description 由收录（meme.save）时的
     caption LLM 调用生成，是 Planner 经 send_messages 发图时选图的唯一依据；
-    hash 与时间线 `<图 hash12 …>` 同一值空间（展示 12 位前缀，库存完整 64 位）。
+    hash 与时间线 `[img hash12 …]` 同一值空间（展示 12 位前缀，库存完整 64 位）。
 
     context_note 是收录时留档的聊天语境（表情包工具黑盒设计.md §2"留档备将来
     重生成"）：meme.recaption 不带新语境时沿用它重跑 caption。**不进 prompt**
@@ -75,18 +70,6 @@ class MemeView:
 
 
 @dataclass(frozen=True)
-class ReflectionView:
-    """最新一版自我认识（agent.reflection_written 折叠，latest-wins）。
-
-    ``at`` 是写下它的时刻，与正文一起渲染——"三小时前想的"和"十分钟前想的"
-    对这段认识还作不作数是两回事，只给正文等于抹掉这个判据。
-    """
-
-    at: datetime
-    text: str
-
-
-@dataclass(frozen=True)
 class TimelineItem:
     """One renderable row in the LLM context (任务与决策契约 §2.1)."""
 
@@ -98,41 +81,24 @@ class TimelineItem:
         "tool_call",
         "system_hint",
         "request",
-        "task_closed",
         "my_reply",
         "reply_task_completed",
         "program",
+        "reflection",
+        "invalid_action",
+        "background",
     ]
     render: str
     related_event_ids: list[str] = field(default_factory=list)
     images: list[ImageRef] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class ProgressNote:
-    """A timestamped LLM-authored note attached to a task; folded from
-    agent.task_progress_noted events."""
-
-    at: datetime
-    note: str
-
-
-@dataclass(frozen=True)
-class TaskView:
-    """Folded task state from agent.task_* events (任务与决策契约 §8)."""
-
-    task_id: str
-    scope_key: str
-    description: str
-    related_tools: list[str]
-    parent_task_id: str | None
-    state: Literal["pending", "running", "done", "failed"]
-    created_at: datetime
-    last_changed_at: datetime
-    last_change_reason: str | None
-    pending_tool_call_ids: list[str]
-    triggered_by_event_id: str | None = None
-    progress_notes: list[ProgressNote] = field(default_factory=list)
+# ProgressNote / TaskView 已于 2026-08-21 删除（渲染格式表 §一②，甲案）。
+# 任务坍缩为单栏便签：没有 ID、没有状态机、没有父子层级、没有逐条进度笔记，
+# 因而也没有需要 dataclass 承载的结构——只剩 DecisionContext.task_note 一个
+# 字符串。连带删除的还有 agent_tasks 读模型表与 agent.task_* 事件族。
+# 不要为了"以后也许要多任务"把它们加回来：多任务并行是数据模型层的概念，
+# 消费便签的是大模型，一段自由文本就写得下两件事。
 
 
 @dataclass(frozen=True)
@@ -168,7 +134,12 @@ class DecisionContext:
     now: datetime
 
     timeline: list[TimelineItem] = field(default_factory=list)
-    active_tasks: list[TaskView] = field(default_factory=list)
+    # ─── 待办便签（2026-08-21 起单栏 latest-wins）───
+    # 由 agent.task_note_written 折出的最新一版正文，渲染成信封顶部的 <task>
+    # 单栏。None / 空串 = 当前无未竟之事，整节不渲染。
+    # 窗口外持久由 Projector._fetch_latest_task_note 一条不受取数窗约束的
+    # LIMIT 1 查询兜底（同 bot_role / <recall>），不再有 agent_tasks 读模型表。
+    task_note: str | None = None
     # ─── 表情包收藏夹（meme_collection 管收藏；send_messages 发送）───
     # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
@@ -176,36 +147,28 @@ class DecisionContext:
     # 其中的 hash 精确删除/换描述，并供发言时选图。空 = 不渲染。
     saved_memes: list[MemeView] = field(default_factory=list)
     # 2026-07-02 起不再有独立的 pending_tool_results 字段：工具结果只在
-    # timeline 的终态 <工具> 行呈现一次（单一事实源）。
+    # timeline 的终态 <tool> 行呈现一次（单一事实源）。
     # 旧的"待消费工具更新区"实现从未做过消费切割——窗口内所有结果每拍
     # 重复以"待你处理"的名义出现，是复读的直接诱饵；且同一调用在 timeline
     # 与 pending 区双重渲染，两处语义必然漂移。ToolResultView 仍保留——它是
     # timeline 渲染 tool-call 行时的折叠视图（fold_tool_results）。
 
     # ─── 程序源码进入时间线（2026-08-14）───
-    # DecisionOutput.program 随 agent.decision_emitted 落库并渲染为 <程序>决策。
-    # 它表示当拍产出了什么，不表示已经落地；落地看 <工具> 与 <程序>完成|失败。
+    # DecisionOutput.program 随 agent.decision_emitted 落库并渲染为 <action>。
+    # 它表示当拍产出了什么，不表示已经落地；落地看 <tool> 与 <program_result>。
 
-    # ─── 自我认识（2026-08-03，reflect 工具）───
-    # agent.reflection_written 折叠出的最新一版正文，latest-wins；渲染成信封
-    # `## 反思` 一节。None / 空串 = 还没写过，整节不出现。
+    # ─── 自我认识（2026-08-03 立；2026-08-21 时间线化）───
+    # agent.reflection_written 不再折叠成 `## 反思` 一节，而是作为**时间线事实
+    # 事件**渲染成 <reflection> 行、逐版留痕。全量覆写会让历史各版彻底消失，模型
+    # 因此看不到自己认识的演变——这是把它搬上时间线的理由。
     #
-    # 它是**第二个**跨拍连续装置（第一个是 active_tasks），两者分工不同：任务
-    # 承载未竟之事、有收束条件；反思承载对自己的认识、没有终点，只被后来的
-    # 版本整段改写。事件本身在 timeline 里消隐（build_timeline 跳过），避免
-    # 同一段文字两处渲染。
+    # 与便签恰好对调（任务与决策契约 §8）：反思要历史，便签只要现状。腾出来的
+    # latest-wins 折叠器交给 task 便签。
     #
-    # 与 2026-08-01 删除的 `<my-thought>` 逐拍 reasoning 回显的边界：那次删的是
-    # **每拍自由笔记原样回到下一拍**（快照实证：变成写给自己的高显著度提示词、
-    # 产出模板化台词）。这里回来的不是笔记而是一段被主动整合过的结论，且低频、
-    # 全量替换、有字数上限——中间隔着一次整合，立场不会逐字继承。勿把本字段
-    # 扩展成"最近 K 版反思"，那会退化回被删掉的那个形态。
-    reflection: ReflectionView | None = None
-
-    # ─── 已退役：同拍「校验拒绝」纠错环（2026-08-11）───
-    # 字段保留以免旧快照/测试构造炸掉；AgentLoop 不再写入，LLMPlanner 若收到
-    # 非 None 仍可渲染，但生产路径恒为 None。
-    validation_feedback: ProgramValidationFeedback | None = None
+    # 与 2026-08-01 删除的 `<my-thought>` 的边界不变：那次删的是**程序注释**
+    # 逐拍原样回灌（快照实证：变成写给自己的高显著度提示词、产出模板化台词），
+    # 现在仍然如此，注释只能经 get_recent_thoughts 主动读回。这里铺开的是
+    # reflect 显式写下、有意留给将来的自我认识，性质不同。
 
     # 当前 tick 上 bot 自己的 QQ user_id（由 bot_registry 提供,AgentLoop
     # 在 tick() 时 resolve 后注入）。None 表示 bot 还没连接 napcat / 注册
@@ -214,12 +177,14 @@ class DecisionContext:
 
     # 当前 tick 在该 group scope 下小奏自己的群角色（owner / admin / member）。
     # 由 Projector.fold_bot_role() 从 runtime.bot_role_observed 事件折出最新值，
-    # AgentLoop 在 dispatch 时原样注入 tool_called.payload.bot_role。它有两个用途：
-    # ① 渲染成信封头部第二行 ``群角色 <role>`` 供 LLM 判断能不能调需要角色的工具；
-    # ② 作为工具内 enforce_bot_admin 的**回退快照**——真正判权限时工具会先
-    #    **实时**向 napcat 查 bot 当前角色（_effective_bot_role），查不到才回退到它。
-    # None = 未观测到（启动初期 sweep 未跑完 / 该群从未写过 baseline）——渲染时不输出
-    # 该属性；工具侧若实时查也拿不到，则保守拒绝带 required_bot_role 的调用。
+    # AgentLoop 在 dispatch 时原样注入 tool_called.payload.bot_role。
+    # 2026-08-21 起它**不再进信封**：群角色随群名/群昵称下沉为 <background>
+    # 事实事件（渲染格式表 §一①）。本字段保留，只剩一个用途——作为工具内
+    # enforce_bot_admin 的**回退快照**：真正判权限时工具先**实时**向 napcat 查
+    # bot 当前角色（_effective_bot_role），查不到才回退到它。它同时也是 Prompt
+    # 快照里记录"这一拍系统认为自己是什么角色"的那一栏。
+    # None = 未观测到（启动初期 sweep 未跑完 / 该群从未写过 baseline）——工具侧
+    # 若实时查也拿不到，则保守拒绝带 required_bot_role 的调用。
     bot_role: Literal["owner", "admin", "member"] | None = None
 
 
@@ -228,8 +193,10 @@ class Planner(Protocol):
 
     Implementations:
     - LLMPlanner — 现役唯一实现；每次调用模型一次并返回响应源码。
-    - report_invalid_output — 静态预检失败后同步回报路由层，冷却当前端点，
-      同拍下一次 decide 换组内下一个模型（不喂校验拒绝文本）。
+    - report_invalid_output — 把"HTTP 200 但正文不可用"这类**属于提供层**的失败
+      同步回报路由层以冷却端点。2026-08-21 起 AgentLoop **不**为静态预检失败调
+      它（渲染格式表 §一⑦ 失败分层）：写错 Python 不是端点的错，也没有同拍下
+      一次 decide 可换——一个响应绑定一次模型执行。
     """
 
     async def decide(self, context: DecisionContext) -> DecisionOutput: ...

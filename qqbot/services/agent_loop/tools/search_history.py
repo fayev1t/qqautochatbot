@@ -3,13 +3,13 @@
 设计动机（任务与决策契约 §动态记忆检索；拓扑 README §5.3 关联）：
 
   Projector 每 tick 只把尾部 100 条 timeline 喂给 LLM——这是控制 prompt
-  长度的硬上限。当 LLM 在某个 task 推进过程中需要更早的上下文（"前天某某
-  说了啥"），它通过这个工具按需检索而不是被动等被裁掉的事件回流。
+  长度的硬上限。当 LLM 需要更早的上下文（"前天某某说了啥"），它通过这个
+  工具按需检索而不是被动等被裁掉的事件回流。
 
 三种过滤方式同时支持（逻辑 AND）：
-  1. 锚点（anchor）：anchor_event_id 直接传，或传 task_id 让工具去查
-     agent.task_created.payload.triggered_by_event_id 作为锚。查询只看
-     anchor 之前发生的事件（ULID 字典序天然=时间序）
+  1. 锚点（anchor）：anchor_event_id，查询只看 anchor 之前发生的事件
+     （ULID 字典序天然=时间序）。2026-08-21 起没有 task_id 这条间接路径——
+     任务坍缩为单栏便签后 task_id 值域消失（渲染格式表 §一②）。
   2. 时间窗：start_time / end_time（ISO8601 字符串）
   3. 关键字：query 用 pg_trgm word_similarity（`<%` 算子）对 search_text
      （STORED GENERATED 列，见 models/agent_event.py）做模糊相似匹配，
@@ -25,7 +25,7 @@ scope 隔离：group 按 group_id 过滤，private 按 user_id 过滤（parse_sc
 
 错误策略：
   - scope_key 缺失 / 非法 → return ToolOutcome.failure(invalid_arguments)（不 raise）
-  - 锚点 task 查不到 / triggered_by_event_id 缺失 → 加 warning，不报错
+  - 时间参数无法解析 → 加 warning，不报错
 """
 
 from __future__ import annotations
@@ -61,8 +61,8 @@ class SearchHistoryTool(BaseTool):
     max_call_sites = 4
     description = (
         "检索当前 scope 中未包含在近期时间线窗口内的历史事件。过滤条件可组合："
-        "anchor_event_id 或 task_id 提供锚点，start_time/end_time 提供时间范围，"
-        "query 对消息文本执行模糊相似度匹配。结果使用与时间线相同的 XML 格式。"
+        "anchor_event_id 提供锚点，start_time/end_time 提供时间范围，"
+        "query 对消息文本执行模糊相似度匹配。结果使用与时间线相同的行文法。"
     )
     usage_prompt = _USAGE_PROMPT
     # required_permission / required_bot_role 用 BaseTool 默认值（GUEST /
@@ -74,13 +74,6 @@ class SearchHistoryTool(BaseTool):
                 "type": "string",
                 "description": (
                     "仅返回严格早于该 event_id 的事件；event_id 为按时间可排序的 ULID。"
-                ),
-            },
-            "task_id": {
-                "type": "string",
-                "description": (
-                    "未提供 anchor_event_id 时，以该任务的 triggered_by_event_id "
-                    "作为锚点。"
                 ),
             },
             "start_time": {
@@ -157,7 +150,6 @@ class SearchHistoryTool(BaseTool):
         warnings: list[str] = []
 
         anchor_event_id = _coerce_str(arguments.get("anchor_event_id"))
-        task_id = _coerce_str(arguments.get("task_id"))
         start_time = _coerce_str(arguments.get("start_time"))
         end_time = _coerce_str(arguments.get("end_time"))
         query = _coerce_str(arguments.get("query"))
@@ -167,15 +159,6 @@ class SearchHistoryTool(BaseTool):
         except (TypeError, ValueError):
             limit = _DEFAULT_LIMIT
         limit = max(1, min(limit, _MAX_LIMIT))
-
-        # task_id → triggered_by_event_id 锚点解析（anchor_event_id 已显式给则优先）
-        if not anchor_event_id and task_id:
-            anchor_event_id = await self._resolve_task_anchor(task_id)
-            if not anchor_event_id:
-                warnings.append(
-                    f"task_id {task_id!r} has no triggered_by_event_id; "
-                    "anchor filter skipped"
-                )
 
         start_dt = _parse_time(start_time) if start_time else None
         end_dt = _parse_time(end_time) if end_time else None
@@ -216,26 +199,6 @@ class SearchHistoryTool(BaseTool):
                 "warnings": warnings,
             }
         )
-
-    async def _resolve_task_anchor(self, task_id: str) -> str | None:
-        """查 agent.task_created 事件的 payload.triggered_by_event_id。
-
-        task_created 的 payload 结构由 AgentLoop._apply_actions 写入；
-        缺字段 / 找不到事件返回 None，让上层加 warning 而不是炸。
-        """
-        stmt = (
-            select(AgentEvent)
-            .where(AgentEvent.type == "agent.task_created")
-            .where(AgentEvent.payload["task_id"].astext == task_id)
-            .limit(1)
-        )
-        async with self._session_factory() as session:
-            result = await session.execute(stmt)
-            row = result.scalars().first()
-        if row is None:
-            return None
-        anchor = (row.payload or {}).get("triggered_by_event_id")
-        return str(anchor) if anchor else None
 
     async def _query(
         self,

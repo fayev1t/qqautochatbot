@@ -2,8 +2,8 @@
 
 External events go through EventIngest (with idempotency_key + ON CONFLICT).
 Internal events (agent.* / runtime.*) come from the loop and its runtime
-workers; no external dedup is needed because they have unique event_ids
-generated locally.
+workers; no external dedup is needed because they immediately request a
+unique event_id from the registrar (no 1s pooling window).
 
 ``announce()`` is the single "写一条事实，然后叫醒这个 scope" boundary
 (2026-08-04)。此前 wait 工具、SilenceWatcher、ReplyExecutor（已于 2026-08-17
@@ -26,12 +26,13 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from qqbot.core.ids import new_event_id
 from qqbot.core.logging import get_logger
 from qqbot.core.time import china_now
+from qqbot.services.event_gateway.registry import issue_event_id
 from qqbot.services.event_gateway.silence_gate import decide_silence_gate
 from qqbot.services.event_ingest.persistence import persist_event
 from qqbot.services.event_ingest.system_event import SystemEvent
@@ -48,9 +49,9 @@ RuntimeEventWriter = Callable[..., Awaitable[str]]
 class AgentEventWrite:
     """一条待写入的 agent.* 事件。
 
-    ``event_id`` 可由调用方预先指定（inline 调度需要先把 tool_called id 注入
-    工具 context）；省略时 batch writer 按列表顺序生成，确保同时间戳事件仍按
-    ULID 保持因果顺序。
+    ``event_id`` 可由调用方预先向注册层领号后指定（inline 调度需要先把
+    tool_called id 注入工具 context）；省略时 batch writer 按列表顺序向
+    注册层领号，确保同时间戳事件仍按 ULID 保持因果顺序。
     """
 
     event_type: str
@@ -96,7 +97,7 @@ async def write_internal_event(
     """
     scope, group_id, user_id = parse_scope_key(scope_key)
     sys_event = _build_system_event(
-        event_id=new_event_id(),
+        event_id=issue_event_id(),
         occurred_at=occurred_at or china_now(),
         origin=origin,
         event_type=event_type,
@@ -110,7 +111,6 @@ async def write_internal_event(
     )
     async with session_factory() as session:
         await persist_event(session, sys_event)
-    await _project_task_event(session_factory, scope_key, sys_event)
     return sys_event.event_id
 
 
@@ -123,12 +123,23 @@ async def write_agent_events(
 ) -> list[str]:
     """原子追加一组 agent.* 事件，并按输入顺序返回 event_id。
 
-    组内所有 INSERT 使用同一个 session、最后只 commit 一次；任何一条失败都不
-    会留下半截 inline 调用链。派生的 ``agent_tasks`` 读模型仍在主事务提交后
-    best-effort 更新，不能反向拖垮 append-only 事实流。
+    有入口网关时走 ``channel=tool``（跳过 1s 窗、同一事务落库）。未接线时
+    退回本函数直写。组内所有 INSERT 同一 session、最后只 commit 一次。
     """
     if not events:
         return []
+    from qqbot.services.event_gateway.outbound import get_inbound_gateway
+
+    gateway = get_inbound_gateway()
+    if gateway is not None:
+        ids = await _submit_agent_batch(
+            gateway,
+            scope_key=scope_key,
+            correlation_id=correlation_id,
+            events=events,
+        )
+        if ids is not None:
+            return ids
     scope, group_id, user_id = parse_scope_key(scope_key)
     default_occurred_at = china_now()
     system_events: list[SystemEvent] = []
@@ -140,7 +151,7 @@ async def write_agent_events(
             )
         system_events.append(
             _build_system_event(
-                event_id=event.event_id or new_event_id(),
+                event_id=event.event_id or issue_event_id(),
                 occurred_at=event.occurred_at or default_occurred_at,
                 origin="agent",
                 event_type=event.event_type,
@@ -159,9 +170,55 @@ async def write_agent_events(
             await persist_event(session, system_event, commit=False)
         await session.commit()
 
-    for system_event in system_events:
-        await _project_task_event(session_factory, scope_key, system_event)
     return [event.event_id for event in system_events]
+
+
+async def _submit_agent_batch(
+    gateway: Any,
+    *,
+    scope_key: str,
+    correlation_id: str,
+    events: list[AgentEventWrite],
+) -> list[str] | None:
+    payload = {
+        "scope_key": scope_key,
+        "correlation_id": correlation_id,
+        "events": [
+            {
+                "event_type": item.event_type,
+                "causation_id": item.causation_id,
+                "payload": item.payload,
+                "event_id": item.event_id,
+            }
+            for item in events
+        ],
+    }
+    occurred = next(
+        (item.occurred_at for item in events if item.occurred_at is not None),
+        None,
+    )
+    try:
+        result = await gateway.submit(
+            "tool", payload, occurred_at=occurred
+        )
+    except Exception as exc:
+        logger.warning(
+            "[event_writer] gateway tool submit failed, falling back: {}", exc
+        )
+        return None
+    if result is None or getattr(result, "status", None) == "error":
+        logger.warning(
+            "[event_writer] gateway tool submit status={}, falling back",
+            getattr(result, "status", None),
+        )
+        return None
+    batch = getattr(result, "events", ()) or ()
+    if batch:
+        return [item.event_id for item in batch]
+    event = getattr(result, "event", None)
+    if event is not None:
+        return [event.event_id]
+    return None
 
 
 def _build_system_event(  # noqa: PLR0913
@@ -195,24 +252,10 @@ def _build_system_event(  # noqa: PLR0913
     )
 
 
-async def _project_task_event(
-    session_factory: SessionFactory,
-    scope_key: str,
-    event: SystemEvent,
-) -> None:
-    # 读模型双写：事件落定**之后**，独立事务 best-effort 投影进 agent_tasks。
-    # 刻意不与事件写同事务 —— 派生视图的失败不能拖垮 append-only 事件流的持久性。
-    if not event.type.startswith("agent.task_"):
-        return
-    from qqbot.services.agent_loop.task_store import apply_task_event_safe
-
-    await apply_task_event_safe(
-        session_factory,
-        event_type=event.type,
-        scope_key=scope_key,
-        occurred_at=event.occurred_at,
-        payload=event.payload,
-    )
+# _project_task_event 已于 2026-08-21 删除（渲染格式表 §一②）。它是 agent_tasks
+# 读模型的双写钩子；便签坍缩为单栏后没有读模型表，也就没有要投影的派生视图。
+# 便签的跨窗口持久改由 Projector._fetch_latest_task_note 一条 LIMIT 1 查询承担
+# ——比 CQRS 双写省一张可变表、也省掉"事件写成功但投影失败"的漂移面。
 
 
 async def write_runtime_event(
@@ -278,26 +321,69 @@ async def announce(  # noqa: PLR0913
     """
     writer = write_event or write_runtime_event
     event_id: str | None = None
-    try:
-        event_id = await writer(
-            session_factory,
-            event_type=event_type,
-            scope_key=scope_key,
-            visibility=visibility,
-            correlation_id=correlation_id,
-            causation_id=causation_id,
-            payload=payload,
-            occurred_at=occurred_at,
-        )
-    except Exception as exc:
+    from qqbot.services.event_gateway.outbound import get_inbound_gateway
+
+    gateway = get_inbound_gateway()
+    if gateway is not None and write_event is None:
+        try:
+            scope, group_id, user_id = parse_scope_key(scope_key)
+            result = await gateway.submit(
+                "other",
+                {
+                    "event_type": event_type,
+                    "scope": scope,
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "visibility": visibility,
+                    "correlation_id": correlation_id,
+                    "causation_id": causation_id,
+                    "payload": payload,
+                },
+                occurred_at=occurred_at,
+            )
+            status = getattr(result, "status", None)
+            event = getattr(result, "event", None)
+            if status != "error" and event is not None:
+                event_id = event.event_id
+            elif status == "error":
+                raise RuntimeError(getattr(result, "reason", None) or "submit")
+        except Exception as exc:
+            if not wake_on_write_failure:
+                raise
+            logger.warning(
+                "[announce] gateway write {} for {} failed (still waking): {}",
+                event_type,
+                scope_key,
+                exc,
+            )
+            event_id = None
+        if event_id is not None:
+            # 登记后的静默门已由 persist 侧 notifier 跑过，这里不再二次 wake。
+            return event_id
         if not wake_on_write_failure:
-            raise
-        logger.warning(
-            "[announce] write {} for {} failed (still waking): {}",
-            event_type,
-            scope_key,
-            exc,
-        )
+            return None
+        # 写失败仍叫醒：落到下面的 gate/wake。
+    else:
+        try:
+            event_id = await writer(
+                session_factory,
+                event_type=event_type,
+                scope_key=scope_key,
+                visibility=visibility,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                payload=payload,
+                occurred_at=occurred_at,
+            )
+        except Exception as exc:
+            if not wake_on_write_failure:
+                raise
+            logger.warning(
+                "[announce] write {} for {} failed (still waking): {}",
+                event_type,
+                scope_key,
+                exc,
+            )
 
     gate = decide_silence_gate(
         event_type=event_type,

@@ -2,7 +2,7 @@
 
 背景：程序形态下查询结果不落事件，但「查到的东西要给以后用就得 return」——
 webfetch / websearch 抓回的正文动辄 8000–20000 字，若原样进入程序值，模型
-唯一的留痕方式就是把大段原文 return 进事件流（`<程序>` 结果行），窗口内每拍
+唯一的留痕方式就是把大段原文 return 进事件流（`<program_result>` 结果行），窗口内每拍
 重复渲染。维护者裁定（2026-08-03）：抓取正文在**工具内部**先过一道 LLM 提炼，
 程序拿到的只是信息密度高的短转述——原文从一开始就不进入程序 ABI，自然也
 不可能被 return 进事件流。
@@ -28,7 +28,6 @@ import asyncio
 import time
 from typing import Any
 
-from qqbot.core.llm import create_llm
 from qqbot.core.logging import get_logger
 from qqbot.services.agent_loop.prompt_snapshot import (
     PromptSnapshot,
@@ -40,7 +39,7 @@ from qqbot.services.agent_loop.prompt_snapshot import (
 logger = get_logger(__name__)
 
 # 提炼产物上限。它是程序里被 return 进事件流的主要候选，必须显著小于
-# `<程序>` 结果行的 6144 字节截断阈值；1500 字足够装下一页的关键事实。
+# `<program_result>` 结果行的 6144 字节截断阈值；1500 字足够装下一页的关键事实。
 # 降级（截断原文）共用同一上限——无论走哪条路，离开工具的文本都有界。
 MAX_DIGEST_CHARS = 1500
 
@@ -91,28 +90,20 @@ async def digest_page_text(
         logger.warning("[web_digest] prompt asset missing: {}", exc)
         return None
 
-    llm = await create_llm(role="web_digest")
-    if llm is None:
-        logger.warning(
-            "[web_digest] no LLM available for role=web_digest "
-            "(config/model_providers.json 未配置且 default 规则也无候选)"
-        )
-        return None
-
     user_text = _compose_user_text(text, url=url, title=title, focus=focus)
 
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    messages = [SystemMessage(content=prompt), HumanMessage(content=user_text)]
+    from qqbot.services.event_gateway.outbound import invoke
 
-    model_spec = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+    messages = [SystemMessage(content=prompt), HumanMessage(content=user_text)]
     # 快照脱敏口径：正文来自公网抓取、不含群聊内容，user_text 可整体入档
     # （与 planner 快照保存完整信封同级）。scope_key=None：提炼不属于单一 scope。
     snapshot: PromptSnapshot | None = None
     if should_snapshot(None):
         snapshot = PromptSnapshot(
             kind="web_digest",
-            model=model_spec,
+            model=None,
             system_prompt=prompt,
             user_text=user_text,
         )
@@ -120,8 +111,8 @@ async def digest_page_text(
     started = time.monotonic()
     try:
         async with _semaphore:
-            raw = await asyncio.wait_for(
-                llm.ainvoke(messages), timeout=_DIGEST_TIMEOUT_SEC
+            invoked = await invoke(
+                "web_digest", messages, timeout=_DIGEST_TIMEOUT_SEC
             )
     except asyncio.CancelledError:
         raise
@@ -141,15 +132,25 @@ async def digest_page_text(
             write_snapshot(snapshot)
         return None
 
-    digest = _extract_text(raw).strip()
     if snapshot is not None:
         snapshot.add_attempt(
             latency_ms=int((time.monotonic() - started) * 1000),
-            response_text=digest,
-            usage=extract_usage(raw),
+            response_text=invoked.text,
+            usage=extract_usage(invoked.raw),
+            error=invoked.error,
         )
-        snapshot.outcome = "ok" if digest else "empty_response"
+        snapshot.outcome = (
+            "call_error"
+            if not invoked.ok
+            else ("ok" if invoked.text.strip() else "empty_response")
+        )
         write_snapshot(snapshot)
+    if not invoked.ok:
+        logger.warning(
+            "[web_digest] call failed: {} url={}", invoked.error, url
+        )
+        return None
+    digest = invoked.text.strip()
     if not digest:
         logger.warning("[web_digest] LLM returned empty text url={}", url)
         return None
@@ -174,9 +175,9 @@ def _compose_user_text(
 def _load_prompt(consumer: str) -> str:
     """required 页：缺失/为空时 render 直接 raise，由调用方折成 None 降级
     （拿空指令去提炼会产出无信息量的转述，不如降级截断原文）。"""
-    from qqbot.services.agent_loop.prompts.catalog import render_system_prompt
+    from qqbot.services.prompt_assembler import assemble
 
-    return render_system_prompt(consumer)
+    return assemble(consumer)
 
 
 def _extract_text(raw: Any) -> str:

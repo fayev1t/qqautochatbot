@@ -13,10 +13,13 @@ Planner 内部建立第三人称人物模型，最终措辞仍由同一层直接
 人格、职责或参与规则时直接改 `planner.md`，改信封语法改
 `envelope.md`，改工具说明改 `tools/<name>.md`，都不需要碰 planner。
 
-每次 decide() 只调用模型一次。静态 preflight 与同拍换端点（最多三次 decide、
-无校验拒绝回灌）由 AgentLoop 承担；本类保留 report_invalid_output()，把
-HTTP 200 但正文不可用的失败同步回报给路由层以冷却端点。LLM 不可用或调用
-失败时返回空程序，等价于本拍 idle。
+每次 decide() 只调用模型一次，AgentLoop 每拍也只 decide 一次——2026-08-21 起
+「一个响应绑定一次模型执行」（渲染格式表 §一⑦）：静态校验归注册层
+（`program_registrar`），内容不合规当场签发 `agent.invalid_action`，**不**换
+端点重生成。写错 Python 不是端点的错，AgentLoop 因此不再为此调
+report_invalid_output()；该方法只留给"HTTP 200 但正文不可用"这类真正属于提供层
+的失败。LLM 不可用或调用失败时返回带 planner_error 的空响应，AgentLoop 据此把
+这一拍记成 planner_error 并**不写任何时间线事件**——传输失败不是模型的表达。
 
 契约：任务与决策契约.md §2-§4
 """
@@ -33,11 +36,8 @@ from qqbot.core.time import CHINA_TIMEZONE
 from qqbot.services.agent_loop.decision import (
     DecisionContext,
     DecisionOutput,
-    ProgramValidationFeedback,
 )
 from qqbot.services.agent_loop.projection import (
-    _esc_text,
-    _flatten,
     _hash12,
     _head_field,
     _ml_text,
@@ -88,8 +88,9 @@ class LLMPlanner:
         prompt_library: PromptLibrary | None = None,
     ) -> None:
         # 测试场景下可注入一个 stub client（提供 ainvoke(messages) 即可）；
-        # 生产场景留 None，首次 decide() 时通过 create_llm() 建好缓存。
+        # 生产场景留 None，走出口网关 invoke（提供层 + 绕回入口登记）。
         self._llm = llm_client
+        self._injected_llm = llm_client is not None
         self._tool_registry = tool_registry
         # prompt_library 优先：调用方明确传入就用它；否则按 tool_registry
         # 装配默认库（planner 根页 + envelope/tools_usage 两个槽）。
@@ -101,17 +102,8 @@ class LLMPlanner:
         self._init_lock = asyncio.Lock()
 
     async def decide(self, context: DecisionContext) -> DecisionOutput:
-        llm = await self._ensure_llm()
-        if llm is None:
-            return DecisionOutput(
-                program="",
-                planner_error="llm_unavailable",
-            )
-
         try:
             messages, snapshot = _build_messages(context, self._prompt_library)
-            if snapshot is not None:
-                snapshot.model = _llm_model_name(llm)
             _log_request(context, messages)
         except Exception as exc:
             logger.warning("[llm_planner] build messages failed: {}", exc)
@@ -122,20 +114,63 @@ class LLMPlanner:
 
         started = time.monotonic()
         try:
-            raw = await llm.ainvoke(messages)
-            text = _extract_text(raw)
+            if self._injected_llm:
+                llm = self._llm
+                if llm is None:
+                    return DecisionOutput(
+                        program="", planner_error="llm_unavailable"
+                    )
+                if snapshot is not None:
+                    snapshot.model = _llm_model_name(llm)
+                raw = await llm.ainvoke(messages)
+                text = _extract_text(raw)
+                _log_response(context, text)
+                if snapshot is not None:
+                    snapshot.add_attempt(
+                        latency_ms=_elapsed_ms(started),
+                        response_text=text,
+                        usage=extract_usage(raw),
+                    )
+                    snapshot.outcome = "received"
+                return DecisionOutput(program=text, raw_response=text)
+
+            from qqbot.services.event_gateway.outbound import invoke
+
+            invoked = await invoke(
+                "planner",
+                messages,
+                extra={
+                    "scope_key": context.scope_key,
+                    "tick_seq": context.tick_seq,
+                    "correlation_id": context.correlation_id,
+                },
+            )
+            text = invoked.text
             _log_response(context, text)
             if snapshot is not None:
+                snapshot.model = _llm_model_name(
+                    getattr(invoked.raw, "__class__", None)
+                )
                 snapshot.add_attempt(
                     latency_ms=_elapsed_ms(started),
                     response_text=text,
-                    usage=extract_usage(raw),
+                    usage=extract_usage(invoked.raw),
+                    error=invoked.error,
                 )
-                snapshot.outcome = "received"
-            return DecisionOutput(
-                program=text,
-                raw_response=text,
-            )
+                snapshot.outcome = (
+                    "call_error" if not invoked.ok else "received"
+                )
+            if not invoked.ok:
+                kind = invoked.error or "unknown"
+                if kind == "llm_unavailable":
+                    return DecisionOutput(
+                        program="", planner_error="llm_unavailable"
+                    )
+                return DecisionOutput(
+                    program="",
+                    planner_error=f"llm_call_error:{kind}",
+                )
+            return _output_from_invoke(invoked)
         except Exception as exc:
             logger.warning("[llm_planner] LLM call failed: {}", exc)
             if snapshot is not None:
@@ -160,7 +195,7 @@ class LLMPlanner:
         try:
             mark_failed(str(reason)[:300])
         except Exception:
-            # 路由记账是 best-effort，绝不能反噬下一次同拍换端点。
+            # 路由记账是 best-effort，绝不能反噬调用方的下一步。
             pass
 
     async def _ensure_llm(self) -> Any:
@@ -170,6 +205,34 @@ class LLMPlanner:
             if self._llm is None:
                 self._llm = await create_llm(role="planner")
             return self._llm
+
+
+def _output_from_invoke(invoked: Any) -> DecisionOutput:
+    ingest = getattr(invoked, "ingest", None)
+    event = getattr(ingest, "event", None) if ingest is not None else None
+    prepared = getattr(ingest, "prepared", None) if ingest is not None else None
+    text = invoked.text
+    if event is None:
+        return DecisionOutput(program=text, raw_response=text)
+    if getattr(event, "type", "") == "agent.invalid_action":
+        return DecisionOutput(
+            program=text,
+            raw_response=text,
+            event_id=event.event_id,
+            accepted=False,
+        )
+    payload = getattr(event, "payload", None) or {}
+    stored = payload.get("program")
+    program = stored if isinstance(stored, str) else text
+    return DecisionOutput(
+        program=program,
+        raw_response=text,
+        event_id=event.event_id,
+        accepted=True,
+        prepared=prepared,
+        left_asset="program_hash" in payload,
+        program_sha256=payload.get("program_sha256"),
+    )
 
 
 def _build_messages(
@@ -184,13 +247,13 @@ def _build_messages(
 
     HumanMessage 的 text block 是**行文法信封**（2026-08-03 起替换 XML；不变量
     与安全模型见主线 Part 3 §2）：timeline 里每条
-    item 的 render 字段本身就是 `<m>` / `<工具>` / `<通知>` 等独立的行（或行块），
+    item 的 render 字段本身就是 `<msg>` / `<tool>` / `<notice>` 等独立的行（或行块），
     外层只需 markdown 节头与少量骨架行；上下引用关系（回复标记、@、工具 ↔ 结果）
     留在行内文法里，不会被 JSON 字符串转义压平成扁平的字段表。
 
     图片（2026-07-28 起）：Planner 是**纯文本模型**，HumanMessage 只有
     文本，不再附带任何图像 block。群里的图在 EventIngest 落盘时就由专用 VLM
-    转录成客观描述，随事件正文进 timeline，渲染成 `<图 hash12: 描述>` ——
+    转录成客观描述，随事件正文进 timeline，渲染成 `[img hash12 : 描述]` ——
     描述内联在它所属的那条消息里，图文时序天然对齐，旧多模态路径靠
     `↓ image hash=` label 给图块对位的做法（3 张图以上常错位）随之作废。
     需要就某张图追问具体问题时走 look_at_image 工具现场重看。
@@ -215,9 +278,6 @@ def _build_messages(
             system_prompt=system_content,
             user_text=input_text,
             sections=section_stats(sections),
-            validation_retry=bool(
-                getattr(context, "validation_feedback", None)
-            ),
         )
 
     # content 是**纯字符串**而非单元素 block 数组：Planner 不再有图，多模态
@@ -236,48 +296,43 @@ def _render_input_text(context: DecisionContext) -> str:
     结构（顺序按**变化频率升序**排列——前缀缓存契约，2026-07-12）：
 
       # 决策输入 <scope>
-      本账号(QQ) 群角色 <role>          (两字段各自可缺)
+      本账号(QQ)                        (可缺)
 
-      ## 表情包收藏                       (有收藏才出)
+      <task>                              (便签为空时整块不出)
+      便签正文
+
+      <memes>                             (有收藏才出)
       <meme><hash12> (<日期>): 描述
 
       ## 时间线
       <t>…
       {item.render …}                    (同秒的行共享一个时刻头)
 
-      ## 反思                             (写过才出)
-      <反思>MM-DD HH:MM
-        正文
-
-      ## 未收束任务
-      <任务>…（_render_task_block）
-
-      <现在>YYYY-MM-DD HH:MM:SS
+      <now>YYYY-MM-DD HH:MM:SS
       （生产路径不再附 <校验拒绝>；字段仅遗留兼容）
 
     缓存契约（2026-07-12）：OpenAI 系 API 的自动前缀缓存要求前缀**逐字节
     一致**。now 每拍必变，曾是信封的头字段，把可缓存前缀掐断在 system
     prompt 末尾——时间线（追加为主，窗口起点锚定见 projection）每拍全价
     重计费。现按变化频率排序：头两行只留 scope/
-    bot_qq/bot_role（稳定/极少变）；表情包收藏只在 save/delete/recaption
-    时变，排在时间线之前，收藏稳定时整段进入可缓存前缀；未收束任务活跃期
-    逐拍变（pending_tool_call_ids 随工具收口增删），排到时间线之后；每拍
-    必变的 now 沉为尾部 ``<现在>``；``validation_feedback`` 生产恒为 None
-    （契约 §7.1），放最尾——同拍重试可复用直到 ``<现在>`` 的前缀，且作为
-    最后一行对模型最显著。2026-08-01 曾把收藏挪到时间线之后换显著性
+    bot_qq（稳定/极少变）；表情包收藏只在 save/delete/recaption
+    时变，排在时间线之前，收藏稳定时整段进入可缓存前缀；每拍必变的 now
+    沉为尾部 ``<now>``。待办便签 2026-08-21 前是"未收束任务"节、活跃期逐拍
+    变（在途调用集合随工具收口增删），因此排在时间线之后；坍缩成单栏
+    latest-wins 之后它只在模型主动重写时才变，与收藏同级，于是上提到收藏
+    之前一起进可缓存前缀。2026-08-01 曾把收藏挪到时间线之后换显著性
     （选图发生在读完局面之后）；2026-08-20 撤回——发图已稳定，收藏段重新
-    进入可缓存前缀。``## 反思``（2026-08-03）排在时间线之后、未收束任务
-    之前：它只在 ``reflect`` 调用那一拍变，比逐拍可变的未收束任务稳定，
-    放前面多吃一段前缀。
+    进入可缓存前缀。``## 反思`` 常驻节已于 2026-08-21 撤销：反思改为时间线
+    事实事件，随时间线一起追加，不再单独占一节。
 
-    工具结果只在时间线的 ``<工具>`` 行呈现一次（2026-07-02 删除了
+    工具结果只在时间线的 ``<tool>`` 行呈现一次（2026-07-02 删除了
     pending-tool-results 区——同一调用双重渲染、且无消费切割地每拍重复
     出现，是模型复读的直接诱饵）。2026-08-01 起 decision_emitted.reasoning
     只保留在运行日志与快照，不再投影进 timeline；跨拍事实与义务分别由客观
     事件行和未收束任务表达。
 
     安全模型（Part 3 §2.1）：一切动态值经 `_esc_text` / `_head_field` /
-    `_ml_text` 净化后才进信封——节头、行头、``<现在>`` 等列 0 结构只可能
+    `_ml_text` 净化后才进信封——节头、行头、``<now>`` 等列 0 结构只可能
     由本函数与投影渲染器落笔。
     """
     parts: list[str] = []
@@ -285,25 +340,45 @@ def _render_input_text(context: DecisionContext) -> str:
     # bot_qq 可选（值来自 context.bot_user_id）：未注入（启动初期 bot_registry
     # 还空、或测试场景）时不渲染；此时模型仍可靠回复标记上服务端标注的
     # ``*``（from_self 由投影层解析，不依赖本行）识别"这条是回复我的"。
-    # bot_role 同样可选：sweep 未完成时 None，不渲染。这是**折叠快照**，仅作
-    # 给 LLM 的角色提示——真正判 bot 权限时工具会**实时**复查当前角色（见
-    # tool_registry._effective_bot_role），快照过期也不会误判。故 prompt 明确
-    # 要求 LLM 不要据此快照"该调不调"：真无权限时工具返回
-    # permission_denied_bot_role，快照过低但已实际升权的调用照样能过。
+    #
+    # 群角色已于 2026-08-21 从头部移走（渲染格式表 §一①、§八1）：它是**群信息**，
+    # 现在随群名／群昵称一起作为 <background> 事实事件进时间线，有发生时刻、
+    # 有先后。留在这里的只剩 scope 与本账号 QQ——前者是信封自己的结构头，后者是
+    # 账号身份，system scope 也成立，都不属于"某个群的情况"。
+    # DecisionContext.bot_role 本身保留：它仍是工具层与快照的读取面，只是不再
+    # 渲进信封。真正判 bot 权限时工具照旧**实时**复查当前角色（见
+    # tool_registry._effective_bot_role），所以 <background> 那 24 小时滞后
+    # （事件系统设计 §4.9 已知缺口①）不会造成误判。
     account_bits: list[str] = []
     if context.bot_user_id:
         account_bits.append(f"本账号({_head_field(context.bot_user_id)})")
-    if context.bot_role:
-        account_bits.append(f"群角色 {_head_field(context.bot_role)}")
     if account_bits:
         parts.append(" ".join(account_bits))
+
+    # ─── 待办便签（2026-08-21 单栏化，渲染格式表 §三2）───
+    # 单一内容栏，latest-wins，正文逐字保留。空/无便签时整块不出现——旧的
+    # `## 未收束任务` 空节头写作"明确当前无任务"，但单栏形态下"没有这一节"
+    # 已经就是这个意思，留个空壳只是每拍多两行。
+    # 正文**整体缩进两空格**（含第一行），与 <reflection> / <recall> 同型。
+    # 格式表 §三2 的样例把正文画在列 0，这里有意不照抄：列 0 是渲染器的，
+    # 正文写着 `## 时间线` 就能凭空长出一个节头。这是她写给自己的字，不是
+    # 外人的输入，但便签里完全可能抄进别人的原话。缩进两空格既守住通则三
+    # （缩进行从属于上方最近的列 0 行），也不改变可读性。
+    task_note = getattr(context, "task_note", None)
+    if isinstance(task_note, str) and task_note.strip():
+        parts.append("")
+        parts.append("<task>")
+        parts.append(f"  {_ml_text(task_note.strip())}")
 
     # ─── 表情包收藏（有才渲染）。少变，排在时间线之前吃前缀缓存。空收藏
     # 整节省略。2026-08-01 曾挪到时间线后换显著性，2026-08-20 撤回。───
     saved_memes = getattr(context, "saved_memes", None) or []
     if saved_memes:
         parts.append("")
-        parts.append("## 表情包收藏")
+        # 2026-08-21：Markdown 节头 `## 表情包收藏` 换成列 0 区块标记
+        # `<memes>`（渲染格式表 §三1）——信封里除 `## 时间线` 外不再混用两套
+        # 结构语法。逐条仍是 `<meme>` 行，形态不变。
+        parts.append("<memes>")
         now_year = context.now.year
         for meme in saved_memes:
             saved = meme.saved_at
@@ -323,37 +398,20 @@ def _render_input_text(context: DecisionContext) -> str:
     # （render_timeline_stream，时间流契约 2026-07-26；纯追加见其 docstring）。
     parts.extend(render_timeline_stream(context.timeline))
 
-    # ─── 反思：她自己写下、由后来的版本整段改写的那一段自我认识 ───
-    # 位置在时间线之后、未收束任务之前：它只在 reflect 调用那一拍变
-    # （静默叫醒或她自己改期），比逐拍可变的未收束任务稳定得多，放在
-    # 前面能多吃一段前缀缓存。
-    #
-    # 与 2026-08-01 删除的 `<my-thought>` 的边界（勿在此扩容）：那次删的是
-    # 每拍自由笔记逐字回显；这里只渲染**最新一版**被主动整合过的结论，且有
-    # 字数上限。任何"再多渲染几版"的改动都会把它退回被删掉的形态。
-    reflection = getattr(context, "reflection", None)
-    if reflection is not None and getattr(reflection, "text", "").strip():
-        parts.append("")
-        parts.append("## 反思")
-        parts.append(
-            f"<反思>{reflection.at.strftime('%m-%d %H:%M')}\n"
-            f"  {_ml_text(reflection.text.strip())}"
-        )
+    # ─── 反思不再单独成节（2026-08-21）───
+    # agent.reflection_written 改为时间线事实事件，由 render_timeline_stream
+    # 渲成 <reflection> 行逐版留痕；原 `## 反思` 常驻节与 latest-wins 折叠一并撤销。
+    # 那套折叠器交给 task 便签：反思要历史，便签只要现状。
 
-    # 未收束任务在 timeline 之后：任务活跃期它逐拍变（pending_tool_call_ids
-    # 随工具收口增删），放前面会在多工具工作流里逐拍掐断 timeline 的缓存前缀；
-    # 放这里还让"当前承诺"紧邻决策位置，显著性只增不减。空集合保留节头
-    # （与旧空 <active-tasks></active-tasks> 同语义：明确"当前无任务"）。
-    parts.append("")
-    parts.append("## 未收束任务")
-    for task in context.active_tasks:
-        parts.append(_render_task_block(task))
+    # ─── `## 未收束任务` 节已于 2026-08-21 删除（渲染格式表 §一②）───
+    # 任务坍缩为单栏便签后它没有条目、没有状态、没有在途调用集合可渲染，
+    # 于是也不再需要一个排在时间线之后的独立节。便签本体上提到了收藏之前。
 
     # <pending-reply> 段已于 2026-07-24 删除（待办#19）——待发稿的调度事实与
-    # 授权内容都在 timeline 的 <工具>reply 行上（参数/结果），独立状态区属于
+    # 授权内容都在 timeline 的 <tool>reply 行上（参数/结果），独立状态区属于
     # 重复渲染。顺带一个缓存收益：它曾是全信封变化最频繁的业务段（每次落稿
     # revision/flush_at 都变、创建/flush 时整段出现消失），撤掉后从未收束
-    # 任务到 <现在> 之间不再有抖动源。
+    # 任务到 <now> 之间不再有抖动源。
 
     # ─── 每拍必变的时钟字段，沉底（缓存契约见本函数 docstring）───
     # @tick 已于 2026-07-30 从信封删除（DecisionContext.tick_seq 本身保留——
@@ -375,60 +433,9 @@ def _render_input_text(context: DecisionContext) -> str:
     else:
         now = now.astimezone(CHINA_TIMEZONE)
     parts.append("")
-    parts.append(f"<现在>{now.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # ─── 同 tick 校验重试反馈（仅重试调用渲染，契约 §7.1）───
-    validation_feedback = getattr(context, "validation_feedback", None)
-    if isinstance(validation_feedback, ProgramValidationFeedback):
-        position = ""
-        if validation_feedback.line is not None:
-            position = f" line={validation_feedback.line}"
-            if validation_feedback.column is not None:
-                position += f" column={validation_feedback.column}"
-        parts.append(
-            f"<校验拒绝>attempt={validation_feedback.attempt} "
-            f"kind={_head_field(validation_feedback.error_kind)}{position}: "
-            f"{_ml_text(validation_feedback.message)}"
-        )
-        parts.append("  <rejected-program>")
-        rejected = validation_feedback.rejected_program.replace(
-            "\r\n", "\n"
-        ).replace("\r", "\n")
-        for line in rejected.split("\n"):
-            parts.append(f"    {_esc_text(line)}")
-        parts.append("  </rejected-program>")
-    elif validation_feedback:
-        # 仅兼容滚动升级期间的旧测试/stub；生产 DecisionContext 使用结构体。
-        parts.append(f"<校验拒绝>{_ml_text(str(validation_feedback))}")
+    parts.append(f"<now>{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     return "\n".join(parts)
-
-
-def _render_task_block(task: Any) -> str:
-    """单条 task → ``<任务>`` 行块（Part 3 §4）。
-
-    头行 ``<任务>task_id state: 目标``；四个子槽（相关工具/起因/在途调用/
-    逐条笔记）有则出、无则省，缩进两空格从属于头行。笔记行的
-    ``[MM-DD HH:MM]`` 缩进出现，不与时间线列 0 时刻头混淆。task_id 与
-    程序 effect 调用的 ``task_id=`` 与 task 工具参数里的同名字段同域。"""
-    lines = [
-        f"<任务>{_head_field(str(task.task_id))} "
-        f"{_esc_text(str(task.state))}: "
-        f"{_esc_text(_flatten(str(task.description)))}"
-    ]
-    related = ",".join(task.related_tools or [])
-    if related:
-        lines.append(f"  相关工具 {_esc_text(related)}")
-    trig = getattr(task, "triggered_by_event_id", None)
-    if trig:
-        lines.append(f"  起因 ev:{_head_field(str(trig))}")
-    pending = ",".join(task.pending_tool_call_ids or [])
-    if pending:
-        lines.append(f"  在途调用 {_esc_text(pending)}")
-    for n in getattr(task, "progress_notes", None) or []:
-        stamp = n.at.strftime("%m-%d %H:%M")
-        lines.append(f"  [{stamp}] {_esc_text(_flatten(str(n.note)))}")
-    return "\n".join(lines)
 
 
 def _elapsed_ms(started_monotonic: float) -> int:

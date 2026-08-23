@@ -4,18 +4,18 @@ Contract: 开发文档/v2.0 —— 任务与决策契约.md §2.1、§8、§11�
 
 Strategy:
 - Fetch the newest agent_visible events for this scope (count-limited window).
-- Fold `agent.task_*` into TaskView snapshots (active_tasks).
+- Fold `agent.task_note_written` latest-wins into the single `<task>` note.
 - Pair `agent.tool_called` with `agent.tool_result | agent.tool_failed`
   into ToolResultView。所属 decision 尚无 program terminal 时，半截调用
   折成 pending / 「已调用」；收口后的半截才是 interrupted。
-  视图**只**用于渲染 timeline 的 <工具> 行——2026-07-02 起不再有独立的
+  视图**只**用于渲染 timeline 的 <tool> 行——2026-07-02 起不再有独立的
   pending_tool_results 区，
   工具结果在 timeline 单点呈现（旧的双重渲染是复读诱饵）。
 - Build the timeline from messages / notices / tool-call pairs / replies /
-  agent-visible runtime hints. Task and tool-result events are folded
+  agent-visible runtime hints. Task-note and tool-result events are folded
   upstream and do NOT produce timeline rows of their own.
-- Render `agent.decision_emitted.payload.program` as ``<程序>决策`` plus
-  the full source. The later ``<程序>完成|失败`` row is a separate event.
+- Render `agent.decision_emitted.payload.program` as ``<action>`` plus
+  the full source. The later ``<program_result>`` row is a separate event.
 
 Folding and rendering are split into pure staticmethods so unit tests
 can drive them without a DB.
@@ -23,7 +23,7 @@ can drive them without a DB.
 Renderers emit compact **line-grammar** rows（行文法，2026-08-03 起替换 XML
 元素/属性渲染；不变量与安全模型见主线 Part 3 §2）。Each renderer:
 - 只保留 XML 的承重基因：一切动态文本经 ``_esc_text``（`&`/`<`/`>`）转义，
-  一切渲染器结构（行头 ``<m>``/``<t>``/``<工具>``…、行内段 ``<图 …>``…）
+  一切渲染器结构（行头 ``<msg>``/``<t>``/``<tool>``…、行内段 ``[img …>``…）
   以 ``<`` 开头——假行头/假段标记在**字符层**不可伪造。第二层防线是换行
   处理：多行容忍位缩进续行、单行字段位压平，动态内容到不了列 0。
 - 行头短字段（名字/头衔/摘要）另做定界净化（半角→全角，`_head_field` /
@@ -57,15 +57,16 @@ from qqbot.models.agent_event import AgentEvent
 from qqbot.services.agent_loop.decision import (
     DecisionContext,
     ImageRef,
-    ProgressNote,
-    ReflectionView,
-    TaskView,
     TimelineItem,
     ToolResultView,
 )
 from qqbot.services.agent_loop.event_writer import parse_scope_key
 
 logger = get_logger(__name__)
+
+# 待办便签事件（2026-08-21，渲染格式表 §一②）。与 tools/task.py 的
+# TASK_NOTE_EVENT_TYPE 同值；这里不 import 那边——投影层不该依赖工具包。
+TASK_NOTE_EVENT_TYPE = "agent.task_note_written"
 
 SessionFactory = Callable[[], AsyncSession]
 
@@ -132,14 +133,14 @@ def _recap_boundary(recap: _EventSnapshot) -> tuple[datetime, str]:
 class Projector:
     # 单条 tool_result 渲染上限：超过即截断尾部并加 <truncated/>。websearch
     # 等工具的 results 列表很容易爆掉 prompt token，必须兜底。
-    # 2026-07-02 从 2048 上调：timeline 的 <工具> 行现在是工具结果的
+    # 2026-07-02 从 2048 上调：timeline 的 <tool> 行现在是工具结果的
     # **唯一**出口（pending-tool-results 区已删除——它曾是不截断的全量渲染，
     # 模型看长结果全靠它），不上调会让长 websearch 结果的可见部分缩水。
     MAX_TOOL_RESULT_CHARS = 6144
 
-    # 单 task 折叠时保留的最近进度笔记条数。LLM 关心的是最近"我自己想到啥"，
-    # 老笔记换 token 不划算。
-    MAX_PROGRESS_NOTES_PER_TASK = 5
+    # <task> 便签正文的渲染上限。与 tools/task.py MAX_TASK_CHARS 同值——
+    # 工具侧已经拒绝超长写入，这里只是防御历史行与手工写入的库数据。
+    MAX_TASK_NOTE_CHARS = 600
 
     # ─── 窗口锚定滞回（2026-07-12，前缀缓存契约）───
     # OpenAI 系 API 的自动前缀缓存要求前缀**逐字节一致**。若裁剪恒取"尾部
@@ -158,7 +159,7 @@ class Projector:
         max_timeline_items: int = 100,
     ) -> None:
         self._session_factory = session_factory
-        # 拉取 fetch 上限保持较大，给 fold_tasks / fold_tool_results 喂够事件；
+        # 拉取 fetch 上限保持较大，给 fold_tool_results / 时间线折叠喂够事件；
         # 真正塞给 LLM 的 timeline 在 project() 里再裁到 max_timeline_items 条。
         # 2026-07-27 300→400：记忆系统不变式③（≥ 压缩触发阈值 250 × 1.5），
         # tick 侧未覆盖计数在阈值处不被截断、recap 正常时都在取数窗内。
@@ -199,6 +200,7 @@ class Projector:
         recap_boundary: tuple[datetime, str] | None = None
         if scope == "group" and group_id is not None:
             recap = await self._fetch_latest_recap(group_id)
+            recap = await self._overlay_group_memory(recap, group_id)
         if recap is not None:
             recap_boundary = _recap_boundary(recap)
 
@@ -254,13 +256,14 @@ class Projector:
                     continue
                 self._timeline_anchors[scope_key] = item.event_id
                 break
-        # 任务持久化补全：fold_tasks 只看最近 300 条取数窗，未完成任务的
-        # task_created 被水群挤出窗口后会从 active_tasks 消失（与"任务跨 tick
-        # 持久"契约冲突，是 bug）。这里查 agent_tasks 读模型，把"仍 pending/
-        # running 但已不在窗口内"的任务补回来。窗口内折出的任务优先（更新、带
-        # 在途 tool_call_ids），表只填补缺口。读模型不可用时整段降级（仍返回
-        # 窗口折叠结果），绝不让 tick 因补全失败而崩。
-        ctx = await self._augment_with_persisted_tasks(ctx, scope_key)
+        # 便签跨窗口补全：窗口折叠只看最近 max_items 条，一段写下之后长期
+        # 不改的便签会被水群挤出去、于是凭空消失。2026-08-21 之前这靠
+        # agent_tasks 读模型表兜底；便签坍缩后不再有读模型（事件系统设计
+        # §7.3），改用一条不受取数窗约束的 LIMIT 1 查询——与 bot_role /
+        # <recall> 同一手法，且比原来的 CQRS 双写更省：没有可变表要维护。
+        # 查询与窗口同上界，所以它的结果恒 ⊇ 窗口折叠值，可直接覆盖。
+        # 失败时整段降级（保留窗口折叠结果），绝不让 tick 因补全失败而崩。
+        ctx = await self._augment_with_task_note(ctx, scope_key, now)
         # 表情包收藏夹注入：查 agent_memes 挂到 ctx.saved_memes，llm_planner
         # 渲染成表情包收藏节（meme 工具凭 hash 前缀操作收藏的选图目录）。同样
         # best-effort 降级——查不到收藏夹只影响本 tick 发不了表情包。
@@ -270,26 +273,55 @@ class Projector:
         # 信封没有独立状态区：一切都在 timeline 上。
         return ctx
 
-    async def _augment_with_persisted_tasks(
-        self, ctx: DecisionContext, scope_key: str
+    async def _augment_with_task_note(
+        self, ctx: DecisionContext, scope_key: str, upper_bound: datetime
     ) -> DecisionContext:
         try:
-            from qqbot.services.agent_loop.task_store import load_active_tasks
-
-            persisted = await load_active_tasks(self._session_factory, scope_key)
-        except Exception as exc:  # 读模型查询失败 → 降级为纯窗口折叠
+            note = await self._fetch_latest_task_note(scope_key, upper_bound)
+        except Exception as exc:  # 查询失败 → 降级为纯窗口折叠
             logger.warning(
-                "[projection] load persisted tasks failed for {}: {}",
-                scope_key,
-                exc,
+                "[projection] load task note failed for {}: {}", scope_key, exc
             )
             return ctx
-        merged = Projector.merge_active_tasks(ctx.active_tasks, persisted)
-        if merged is ctx.active_tasks:
+        if note == ctx.task_note:
             return ctx
         from dataclasses import replace
 
-        return replace(ctx, active_tasks=merged)
+        return replace(ctx, task_note=note)
+
+    async def _fetch_latest_task_note(
+        self, scope_key: str, upper_bound: datetime
+    ) -> str | None:
+        """查该 scope 最新一条 ``agent.task_note_written`` 的正文。
+
+        不走 ``_fetch`` 的条数取数窗：便签可能几百条消息之前写下、此后一直
+        没改，硬依赖取数窗会让它凭空消失——那正是 2026-08-21 之前要靠
+        ``agent_tasks`` 读模型表解决的问题。上界与窗口一致（``context.now``），
+        所以本查询结果恒 ⊇ 窗口折叠值。
+
+        空正文是**合法值**，语义是"便签已清空"，返回 ``None``（与"从没写过"
+        同一渲染结果：整节不出现）。
+        """
+        from sqlalchemy import desc
+
+        scope, group_id, user_id = parse_scope_key(scope_key)
+        stmt = (
+            select(AgentEvent.payload)
+            .where(AgentEvent.type == TASK_NOTE_EVENT_TYPE)
+            .where(AgentEvent.scope == scope)
+            .where(AgentEvent.occurred_at <= upper_bound)
+        )
+        if group_id is not None:
+            stmt = stmt.where(AgentEvent.group_id == group_id)
+        if user_id is not None:
+            stmt = stmt.where(AgentEvent.user_id == user_id)
+        stmt = stmt.order_by(
+            desc(AgentEvent.occurred_at), desc(AgentEvent.event_id)
+        ).limit(1)
+        async with self._session_factory() as session:
+            result = await session.execute(stmt)
+            payload = result.scalars().first()
+        return _task_note_of(payload)
 
     async def _augment_with_saved_memes(
         self, ctx: DecisionContext, scope_key: str
@@ -321,25 +353,6 @@ class Projector:
         from dataclasses import replace
 
         return replace(ctx, saved_memes=memes)
-
-    @staticmethod
-    def merge_active_tasks(
-        window_tasks: Sequence[TaskView],
-        persisted_tasks: Sequence[TaskView],
-    ) -> list[TaskView]:
-        """窗口折叠任务 ∪ 读模型任务，按 created_at 升序。
-
-        纯函数（无 DB），便于单测。窗口版本优先：同一 task_id 两边都有时保留
-        窗口版（它带在途 tool_call_ids、进度更新；读模型版 pending_tool_call_ids
-        恒为空）。读模型只补"窗口里没有"的未完成任务。无补充时原样返回入参
-        list（调用方据此判断是否需要 replace）。
-        """
-        window_ids = {t.task_id for t in window_tasks}
-        extra = [t for t in persisted_tasks if t.task_id not in window_ids]
-        if not extra:
-            # 原样返回入参对象 —— 调用方用 `is` 判断"无变化"省一次 replace。
-            return window_tasks  # type: ignore[return-value]
-        return sorted([*window_tasks, *extra], key=lambda t: t.created_at)
 
     async def _fetch_latest_bot_role(
         self,
@@ -400,6 +413,31 @@ class Projector:
             result = await session.execute(stmt)
             rows = list(result.scalars().all())
         return _snapshot_from_row(rows[0]) if rows else None
+
+    async def _overlay_group_memory(
+        self, recap: _EventSnapshot | None, group_id: int
+    ) -> _EventSnapshot | None:
+        """读侧 ``group_memories`` 覆盖摘要正文；失败或空行回退事件 payload。"""
+        if recap is None:
+            return None
+        try:
+            from qqbot.services.group_memory_store import load_group_memory
+
+            content = await load_group_memory(self._session_factory, group_id)
+        except Exception as exc:
+            logger.warning(
+                "[projection] load group_memories failed group_id={}: {}",
+                group_id,
+                exc,
+            )
+            return recap
+        if not isinstance(content, str) or not content.strip():
+            return recap
+        from dataclasses import replace
+
+        payload = dict(recap.payload or {})
+        payload["summary"] = content
+        return replace(recap, payload=payload)
 
     async def _fetch(
         self,
@@ -463,8 +501,8 @@ class Projector:
         timeline_anchor: str | None = None,
         pinned_event_id: str | None = None,
     ) -> DecisionContext:
-        active_tasks = Projector.fold_tasks(events, scope_key=scope_key)
-        # tool_views 只喂给 timeline 渲染（<工具> 行按两态折叠）；不再
+        task_note = Projector.fold_task_note(events)
+        # tool_views 只喂给 timeline 渲染（<tool> 行按两态折叠）；不再
         # 另出 pending_tool_results 区——同一调用双重渲染曾是复读的直接诱饵。
         tool_views = Projector.fold_tool_results(events)
         timeline = Projector.build_timeline(
@@ -498,13 +536,12 @@ class Projector:
         # 事件列表里 fold 一次——支持纯函数测试不需要 DB 也能验证 fold 逻辑。
         if bot_role is None:
             bot_role = Projector.fold_bot_role(events, bot_user_id=bot_user_id)
-        reflection = Projector.fold_reflection(events)
         # 类型上 DecisionContext.bot_role 是 Literal[...]，但跑期我们对未知值
         # 一律 None（防止 LLM 拿到"垃圾角色字符串"做判断）。
         normalized_role: str | None = None
         if isinstance(bot_role, str):
             low = bot_role.strip().lower()
-            if low in ("owner", "admin", "member"):
+            if low in _BOT_ROLES:
                 normalized_role = low
         return DecisionContext(
             scope_key=scope_key,
@@ -512,33 +549,10 @@ class Projector:
             tick_seq=tick_seq,
             now=now,
             timeline=timeline,
-            active_tasks=active_tasks,
-            reflection=reflection,
+            task_note=task_note,
             bot_user_id=bot_user_id,
             bot_role=normalized_role,  # type: ignore[arg-type]
         )
-
-    @staticmethod
-    def fold_reflection(events: Sequence[_EventSnapshot]) -> ReflectionView | None:
-        """agent.reflection_written → 最新一版自我认识正文（latest-wins）。
-
-        与 recap 同型的"只认最新一条"折叠：``reflect`` 是全量替换语义，历史
-        版本只作为审计留在事件流里，不参与渲染。窗口里一条都没有（从没写过，
-        或最早那版已经滚出取数窗）时返回 None，整节不渲染。
-
-        注意折叠依据是**窗口内**最后一条：反思滚出窗口后会整节消失，而不是
-        永久沿用最后见到的那版。这与 recap 借 apply_recap_window 钉住下界
-        的处理不同——反思是可再生的（下一次静默叫醒会重写一版），钉住它会
-        让一段过期认识无限期地留在她面前。
-        """
-        latest: ReflectionView | None = None
-        for ev in events:
-            if ev.type != "agent.reflection_written":
-                continue
-            text = (ev.payload or {}).get("text")
-            if isinstance(text, str) and text.strip():
-                latest = ReflectionView(at=ev.occurred_at, text=text.strip())
-        return latest
 
     @staticmethod
     def _trim_timeline(
@@ -624,69 +638,26 @@ class Projector:
     # ─── Folding helpers ───
 
     @staticmethod
-    def fold_tasks(
-        events: Iterable[_EventSnapshot], *, scope_key: str
-    ) -> list[TaskView]:
-        """Pending / running TaskView list. done/failed are dropped (kept
-        only as historical events; the LLM sees them via task_* but not in
-        active_tasks)."""
-        tasks: dict[str, dict] = {}
+    def fold_task_note(events: Iterable[_EventSnapshot]) -> str | None:
+        """窗口内最新一条 ``agent.task_note_written`` 的正文（latest-wins）。
+
+        纯函数（无 DB），便于单测；生产路径另有
+        ``_fetch_latest_task_note`` 兜住窗口外的旧便签。事件流本身有序，
+        所以直接取最后一条命中即可，不比较时刻。
+
+        空正文（模型传了 ``content=""``）语义是"便签已清空"，返回 None——与
+        "从没写过"同一渲染结果：整节不出现。清空是一次**真实的覆写**，它必须
+        压掉更早那版有内容的便签，所以不能写成"跳过空值继续往前找"。
+
+        2026-08-21 取代 ``fold_tasks``（渲染格式表 §一②）：没有 ID、没有状态
+        机、没有父子层级、没有在途调用集合，因而也没有 done/failed 要过滤。
+        """
+        latest: str | None = None
         for ev in events:
-            if ev.type == "agent.task_created":
-                tid = ev.payload.get("task_id")
-                if not tid:
-                    continue
-                tasks[tid] = {
-                    "task_id": tid,
-                    "scope_key": scope_key,
-                    "description": ev.payload.get("description", ""),
-                    "related_tools": list(ev.payload.get("related_tools") or []),
-                    "parent_task_id": ev.payload.get("parent_task_id"),
-                    "state": "pending",
-                    "created_at": ev.occurred_at,
-                    "last_changed_at": ev.occurred_at,
-                    "last_change_reason": None,
-                    "pending_tool_call_ids": [],
-                    "triggered_by_event_id": ev.payload.get("triggered_by_event_id"),
-                    "progress_notes": [],
-                }
-            elif ev.type == "agent.task_state_changed":
-                tid = ev.payload.get("task_id")
-                if not tid or tid not in tasks:
-                    continue
-                tasks[tid]["state"] = ev.payload.get("to_state", tasks[tid]["state"])
-                tasks[tid]["last_changed_at"] = ev.occurred_at
-                tasks[tid]["last_change_reason"] = ev.payload.get("reason")
-            elif ev.type == "agent.task_progress_noted":
-                tid = ev.payload.get("task_id")
-                note = ev.payload.get("note")
-                if not tid or tid not in tasks or not note:
-                    continue
-                tasks[tid]["progress_notes"].append(
-                    ProgressNote(at=ev.occurred_at, note=str(note))
-                )
-            elif ev.type == "agent.tool_called":
-                tid = ev.payload.get("task_id")
-                tc_id = ev.payload.get("tool_call_id")
-                if tid and tid in tasks and tc_id:
-                    tasks[tid]["pending_tool_call_ids"].append(tc_id)
-            elif ev.type in ("agent.tool_result", "agent.tool_failed"):
-                tc_id = ev.payload.get("tool_call_id")
-                for t in tasks.values():
-                    if tc_id in t["pending_tool_call_ids"]:
-                        t["pending_tool_call_ids"].remove(tc_id)
-
-        # 每个 task 保留最近 N 条进度笔记 —— 时间顺序由 event stream 保证。
-        for t in tasks.values():
-            notes = t["progress_notes"]
-            if len(notes) > Projector.MAX_PROGRESS_NOTES_PER_TASK:
-                t["progress_notes"] = notes[-Projector.MAX_PROGRESS_NOTES_PER_TASK :]
-
-        return [
-            TaskView(**d)
-            for d in tasks.values()
-            if d["state"] in ("pending", "running")
-        ]
+            if ev.type != TASK_NOTE_EVENT_TYPE:
+                continue
+            latest = _task_note_of(ev.payload)
+        return latest
 
     @staticmethod
     def fold_tool_results(
@@ -792,24 +763,16 @@ class Projector:
                         )
                     )
                 continue
-            if ev.type == "agent.task_state_changed":
-                # 任务收束（done/failed）渲染为 <task-closed> 行——模型对
-                # "自己刚完成/放弃了什么、结论是什么"的事后记忆（2026-07-02，
-                # 此前任务一收束就从 active_tasks 消失、result_summary 蒸发）。
-                # 中间态迁移（pending→running 等）仍消隐。
-                to_state = (ev.payload or {}).get("to_state")
-                if to_state in ("done", "failed"):
-                    items.append(
-                        TimelineItem(
-                            event_id=ev.event_id,
-                            occurred_at=ev.occurred_at,
-                            kind="task_closed",
-                            render=Projector._render_task_closed(ev, to_state),
-                        )
-                    )
-                continue
             if ev.type.startswith("agent.task_"):
-                # folded into active_tasks
+                # 便签折进顶部 <task> 单栏，不进时间线（渲染格式表 §一②：
+                # 反思要历史，便签只要现状）。
+                #
+                # 2026-08-21 起 `<task_closed>` 行型一并删除：它渲染的是
+                # agent.task_state_changed(done|failed)，而状态机本身没了。
+                # 库里的存量 task_created / task_state_changed /
+                # task_progress_noted 行落到这条分支上静默消隐——它们描述的是
+                # 一套已经不存在的结构，逐字渲染出来只会让她照着一个没有的
+                # 工具形态去用 task()。
                 continue
             if ev.type in ("agent.tool_result", "agent.tool_failed"):
                 # rendered alongside the matching tool_called row。
@@ -823,16 +786,60 @@ class Projector:
                 "agent.reply_task_upserted",
                 "agent.reply_task_cancelled",
             ):
-                # 领域事件消隐：同一次授权已由它的 <工具>reply 行
+                # 领域事件消隐：同一次授权已由它的 <tool>reply 行
                 # 完整呈现（<args> 授权原文 + <result> 调度事实），再渲染一遍
                 # 就是双重渲染。它们仍是 reply_task 折叠的数据源，只是不进
                 # timeline。
                 continue
             if ev.type == "agent.reflection_written":
-                # 领域事件消隐：正文已由 fold_reflection 折成 `## 反思` 一节
-                # 常驻渲染，再在时间线上出现一次就是双重渲染——而且历史版本
-                # 一并铺开，正好构成被 2026-08-01 删掉的"最近 K 版自我笔记"
-                # 形态。写下这件事本身由它的 <工具>reflect 行呈现。
+                # 2026-08-21 时间线化：不再消隐折成 `## 反思` 一节，而是逐版
+                # 留在时间线上。latest-wins 全量覆写会让历史各版彻底消失，
+                # 模型看不到自己认识是怎么变过来的；那套折叠器交给 task 便签。
+                #
+                # 与 2026-08-01 删除的 <my-thought> 的边界（勿在此扩容）：那次
+                # 删的是**程序注释**逐拍原样回灌，现在仍然如此（注释只经
+                # get_recent_thoughts 主动读回）。这里铺开的是 reflect 显式
+                # 写下、有意留给将来的结论，低频且有字数上限，不是逐拍笔记。
+                rendered = Projector._render_reflection(ev)
+                if rendered is not None:
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="reflection",
+                            render=rendered,
+                        )
+                    )
+                continue
+            if ev.type == "agent.invalid_action":
+                # 注册层拦截（2026-08-21，渲染格式表 §一⑦）。它**回灌被拒源码**：
+                # 模型看得见自己写错的那一段才谈得上自纠正，这推翻了 2026-08-11
+                # 「不回灌」的旧决议。取代已废止的 runtime.llm_invalid_output。
+                rendered = Projector._render_invalid_action(ev)
+                if rendered is not None:
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="invalid_action",
+                            render=rendered,
+                        )
+                    )
+                continue
+            if ev.type == "agent.background_noted":
+                # 每日群聊背景（2026-08-21，渲染格式表 §一①）：原信封头部的
+                # 折叠快照下沉为时间线事实事件，于是"群叫这个名字"也有了发生
+                # 时刻与先后。写入方是 daily_background，不是任何一拍。
+                rendered = Projector._render_background(ev)
+                if rendered is not None:
+                    items.append(
+                        TimelineItem(
+                            event_id=ev.event_id,
+                            occurred_at=ev.occurred_at,
+                            kind="background",
+                            render=rendered,
+                        )
+                    )
                 continue
             if ev.type == "agent.decision_emitted":
                 rendered = Projector._render_decision(ev)
@@ -910,7 +917,7 @@ class Projector:
                 )
             elif ev.type == "runtime.reply_flushed":
                 # 旧链路历史事件（2026-07-31 起新链路不写 flushed；现役发言
-                # 记录是 send_messages 的 <工具> 行）。
+                # 记录是 send_messages 的 <tool> 行）。
                 items.append(
                     TimelineItem(
                         event_id=ev.event_id,
@@ -974,10 +981,10 @@ class Projector:
         *,
         bot_user_id: str | None = None,
     ) -> tuple[str, list[ImageRef]]:
-        """消息行：``<m>名字(QQ[/身份][/匿名][/「头衔」]) #消息ID
+        """消息行：``<msg>名字(QQ[/身份][/匿名][/「头衔」]) #消息ID
         [回复#ID(作者)「摘要」]: 正文``。
 
-        行头（``<m>`` 到第一个 ``: ``）是渲染器领地：名字/头衔经
+        行头（``<msg>`` 到第一个 ``: ``）是渲染器领地：名字/头衔经
         ``_head_field`` 定界净化，reply 段从正文**上提**为行头标记（行文法
         §5.2——被引内容属于作者、新文本属于发送者，位置上先于正文更不易
         误认）。正文 = 其余段的混排，时刻由外层 ``<t>`` 头承载。缺哪个字段
@@ -1044,7 +1051,7 @@ class Projector:
         if slots:
             name_part += f"({'/'.join(slots)})"
 
-        head = f"<m>{name_part}"
+        head = f"<msg>{name_part}"
         # #消息ID：与工具参数 message_id / 出站 reply 段 data.id 同域。
         if msg_id:
             head += (" " if name_part else "") + f"#{_head_field(str(msg_id))}"
@@ -1066,7 +1073,7 @@ class Projector:
         *,
         bot_user_id: str | None = None,
     ) -> str:
-        """通知行：``<通知>kind 模板句``（Part 3 §3.1）。
+        """通知行：``<notice>kind 模板句``（Part 3 §3.1）。
 
         kind 保留 OneBot 原始枚举词作锚，正文是逐 kind 的模板句——比属性堆
         可读且更省。人物一律 ``名(QQ)`` 形态（近期消息反查名字，查不到只渲
@@ -1079,7 +1086,7 @@ class Projector:
         sentence = _notice_sentence(kind, ev, names, bot_user_id=bot_user_id)
         if sentence is None:
             sentence = _esc_text(_safe_json(ev.payload or {}))
-        return f"<通知>{_esc_text(kind)} {sentence}"
+        return f"<notice>{_esc_text(kind)} {sentence}"
 
     @staticmethod
     def _render_request(ev: _EventSnapshot) -> str:
@@ -1095,7 +1102,7 @@ class Projector:
         事件 payload 里的 flag，这样 napcat 的 flag 凭证不经过 LLM 复述，避免
         长串照抄出错。comment 是申请人填的验证留言（提醒/决策的主要依据）。
         """
-        parts = [f"<加群申请>ev:{_head_field(str(ev.event_id))}"]
+        parts = [f"<join_request>ev:{_head_field(str(ev.event_id))}"]
         if ev.user_id is not None:
             parts.append(f"申请人({ev.user_id})")
         comment = ev.payload.get("comment")
@@ -1109,7 +1116,7 @@ class Projector:
     def _render_tool_call(ev: _EventSnapshot, tv: ToolResultView | None) -> str:
         """工具行（Part 3 §3.2）：
 
-        ``<工具>名 完成|失败[ kind k=v …]`` + 缩进的
+        ``<tool>名 完成|失败[ kind k=v …]`` + 缩进的
         ``参数`` / ``结果``（成功，超限加 ``（截断）``）/ ``原因``（失败）行。
         发起时刻由外层 ``<t>`` 时刻头承载。
 
@@ -1141,7 +1148,7 @@ class Projector:
                 return special
 
         if tv.error_kind == "pending":
-            return f"<工具>{_esc_text(name)} 已调用\n{args_line}"
+            return f"<tool>{_esc_text(name)} 已调用\n{args_line}"
 
         if tv.error_kind is None:
             result_json = _safe_json(tv.result)
@@ -1150,46 +1157,84 @@ class Projector:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
                 truncated = "（截断）"
             return (
-                f"<工具>{_esc_text(name)} 完成\n{args_line}\n"
+                f"<tool>{_esc_text(name)} 完成\n{args_line}\n"
                 f"  结果 {_esc_text(result_json)}{truncated}"
             )
         head_extra = _error_head_suffix(tv.error_kind, tv.error_extra)
-        lines = [f"<工具>{_esc_text(name)} 失败{head_extra}", args_line]
+        lines = [f"<tool>{_esc_text(name)} 失败{head_extra}", args_line]
         if tv.error_message:
             lines.append(f"  原因 {_ml_text(str(tv.error_message))}")
         return "\n".join(lines)
 
     @staticmethod
     def _render_decision(ev: _EventSnapshot) -> str | None:
-        """``agent.decision_emitted`` → ``<程序>决策 ev:X`` plus full source.
+        """``agent.decision_emitted`` → ``<action>`` 行块（渲染格式表 §五3）。
 
-        ``ev:X`` 是这段源码自己的事件 ID（2026-08-17 提案-裁决流水线）：写下的
-        程序不会当拍执行，要执行得由后一拍写 ``execute_decision(event_id=…)``
-        指名，因此这个 ID 必须对模型可见。它与 ``<程序>完成|失败`` 行上回指的
-        ID 同域，据此把终态与它所收束的那段源码对上。
+        三行结构，后两行各自可缺——两层正交，一拍可以只有一层::
+
+            <action> ev:01K3P822…          ← 这条事件自己的 ID
+            execute_program: 8f3c4e5a6b7c  ← 裁决层，作用于代码资产
+            next_action {1a2b3c4d5e6f}:    ← 动作层，本拍新起草的代码
+              <源码缩进两格>
+
+        ``ev:`` 供 ``<program_result>`` 回指，让模型看得出某次运行是哪一拍
+        下的令。``next_action`` 的 ``{hash}`` 是这段源码作为**代码资产**的身份
+        （``sha256(源码)[:12]``）——写下的程序不会当拍执行，要执行得由后一拍
+        写 ``execute_program(program_hash=…)`` 指名，抄不到这个 hash 就永远
+        执行不了自己写下的任何东西。
+
+        两个值域不可互推：``ev:`` 命名"发生过的事"，``{hash}`` 命名"不可变
+        的代码"。没写下动作层代码的拍（空程序、纯裁决）payload 里没有 hash，
+        整个 ``next_action`` 块不出现。
+
+        **``execute_program:`` 读的是 payload 里单独存的目标 hash，不是从源码
+        里扒的**——落库解耦（防套娃）保证存下来的 program 正文里绝不含调度
+        指令，所以那一行必须另有出处。
         """
         payload = ev.payload or {}
         if "program" not in payload:
             return None
-        head = f"<程序>决策 ev:{_head_field(str(ev.event_id))}"
+        lines = [f"<action> ev:{_head_field(str(ev.event_id))}"]
+
+        commit_hash = payload.get("commit_program_hash")
+        if isinstance(commit_hash, str) and commit_hash:
+            lines.append(f"execute_program: {_head_field(commit_hash)}")
+
+        program_hash = payload.get("program_hash")
         raw = payload.get("program")
         source = raw if isinstance(raw, str) else str(raw)
-        if not source.strip():
-            return f"{head}\n  （空程序）"
-        return f"{head}\n  {_ml_text(source)}"
+        if isinstance(program_hash, str) and program_hash and source.strip():
+            lines.append(f"next_action {{{_head_field(program_hash)}}}:")
+            lines.append(f"  {_ml_text(source)}")
+        elif source.strip():
+            # 历史事件：2026-08-21 之前写的决策没有 program_hash 键。正文还在，
+            # 照旧渲染出来，只是没有可指名的资产身份。
+            lines.append("next_action:")
+            lines.append(f"  {_ml_text(source)}")
+        elif len(lines) == 1:
+            # 两层都空 = 停止符。留一行说明，否则时间线上只剩一个孤零零的 ev:。
+            lines.append("（空程序）")
+        return "\n".join(lines)
 
     @staticmethod
     def _render_program(ev: _EventSnapshot) -> str | None:
-        """Program terminal → one source-free ``<程序>`` line block.
+        """Program terminal → 一行 ``<program_result>``（渲染格式表 §五5）。
 
-        行头回指它收束的那条 ``<程序>决策`` 的 ``ev:``（payload.decision_id，
-        缺失时退回 causation_id）——并发派发下同一屏可以有多段程序在跑，靠位置
-        对不上号。
+        ``<program_result> {hash} ev:{调度事件} status:ok|failed``，正文另起
+        ``result:`` 或 ``reason:`` 缩进行。**hash 与 ev: 缺一不可**：
+        2026-08-21 取消 ``already_executed`` 后同一份资产可以合法并发跑多次，
+        只凭 hash 分不出是哪一次运行，``(调度事件, 资产 hash)`` 才唯一确定一
+        次。并发派发下同一屏可以有多段程序在跑，靠位置更对不上号。
+
+        ``ev:`` 取 payload.dispatch_event_id，缺失时退回 decision_id /
+        causation_id（历史事件）。程序源码永不出现在本行——它在写下它的那条
+        ``<action>`` 上，此处只报结果。
         """
         payload = ev.payload or {}
         anchor = _decision_anchor(ev)
+        hash_part = _program_hash_part(ev)
         if ev.type == "agent.program_completed":
-            head = f"<程序>完成{anchor}"
+            head = f"<program_result>{hash_part}{anchor} status:ok"
             has_result = bool(payload.get("has_result"))
             if not has_result:
                 return head
@@ -1198,33 +1243,107 @@ class Projector:
             if len(result_json) > Projector.MAX_TOOL_RESULT_CHARS:
                 result_json = result_json[: Projector.MAX_TOOL_RESULT_CHARS]
                 truncated = "（截断）"
-            return f"{head}\n  结果 {_esc_text(result_json)}{truncated}"
+            return f"{head}\nresult: {_esc_text(result_json)}{truncated}"
 
         error_kind = str(payload.get("error_kind") or "unknown")
         extra = _extract_program_error_extra(payload)
-        head = f"<程序>失败{anchor}{_error_head_suffix(error_kind, extra)}"
+        head = (
+            f"<program_result>{hash_part}{anchor} status:failed"
+            f"{_error_head_suffix(error_kind, extra)}"
+        )
         message = payload.get("error_message")
         if isinstance(message, str) and message:
-            return f"{head}\n  原因 {_ml_text(message)}"
+            return f"{head}\nreason: {_ml_text(message)}"
         return head
 
     @staticmethod
-    def _render_task_closed(ev: _EventSnapshot, outcome: str) -> str:
-        """agent.task_state_changed(done|failed) → <task-closed> 行。
+    def _render_invalid_action(ev: _EventSnapshot) -> str | None:
+        """``agent.invalid_action`` → ``<invalid_action>`` 行块。
 
-        正文是模型自己写的 result_summary / 失败原因（task 工具 complete / fail
-        分支落进 payload.reason）——收束后 active_tasks 里不再有
-        这个任务，本行是"这事我已经办完了、结论是什么"的唯一事后记忆。防御性
-        截 600 字（模型摘要正常远短于此）。
+        两个子槽：``reason:`` 是真实静态 kind 加定位，``raw_text:`` 是被拒源码
+        全文（缩进两格）。回灌源码是本行存在的理由——只说"你写错了"而不给出
+        错在哪一段，模型无从改起。
+
+        ``reason`` 走 ``_inline_text``（压平 + 转义）而不是 ``_head_field``：
+        它不是行头，没有"首个 `: ` 即定界"的解析需求，把冒号和括号打成全角
+        只会让模型读到的错误说明失真。源码逐行走 ``_esc_text``——那本就是模型
+        写的自由文本，可能含列 0 的 ``<`` 与 ``&``，不转义就能伪造行标记。
         """
         payload = ev.payload or {}
-        task_id = str(payload.get("task_id") or "?")
-        outcome_word = "完成" if outcome == "done" else "失败"
         reason = payload.get("reason")
-        head = f"<任务收束>{_head_field(task_id)} {outcome_word}"
-        if isinstance(reason, str) and reason.strip():
-            return f"{head}: {_ml_text(reason.strip()[:600])}"
-        return head
+        if not isinstance(reason, str) or not reason.strip():
+            kind = payload.get("error_kind")
+            reason = str(kind) if kind else "invalid_action"
+        parts = ["<invalid_action>", f"reason: {_inline_text(reason.strip())}"]
+        raw_text = payload.get("raw_text")
+        if isinstance(raw_text, str) and raw_text.strip():
+            normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+            parts.append("raw_text:")
+            parts.extend(f"  {_esc_text(line)}" for line in normalized.split("\n"))
+        return "\n".join(parts)
+
+    @staticmethod
+    def _render_background(ev: _EventSnapshot) -> str | None:
+        """``agent.background_noted`` → ``<background>`` 时间线行（2026-08-21）。
+
+        头行是裸标记，五个字段各占一条两空格缩进的续行（``key: value``）。
+        缺字段整行不出——按信封通则一，缺失读作"未知"，写 ``group_role: null``
+        会被读成"角色是 null"。全部字段都缺时返回 None，不渲染空壳。
+
+        安全：``group_name`` 与 ``self_group_nick_name`` 是**用户可控**的
+        （群主改群名、管理员改本账号名片）。走 ``_head_field``——与 ``<msg>``
+        行头里的人名同一套净化：压平换行防伪造列 0 行，半角 ``[ ]`` 中和成全角
+        防伪造内联段。``group_id`` 是整数、``group_role`` 出自闭集、日期由本
+        进程生成，都不经外部文本。
+        """
+        payload = ev.payload or {}
+        lines: list[str] = []
+
+        name = payload.get("group_name")
+        if isinstance(name, str) and name.strip():
+            lines.append(f"  group_name: {_head_field(name)}")
+
+        group_id = payload.get("group_id")
+        if isinstance(group_id, int) or (
+            isinstance(group_id, str) and group_id.strip().isdigit()
+        ):
+            lines.append(f"  group_id: {int(group_id)}")
+
+        nick = payload.get("self_group_nick_name")
+        if isinstance(nick, str) and nick.strip():
+            lines.append(f"  self_group_nick_name: {_head_field(nick)}")
+
+        role = payload.get("group_role")
+        if isinstance(role, str) and role.strip().lower() in _BOT_ROLES:
+            lines.append(f"  group_role: {role.strip().lower()}")
+
+        date = payload.get("date")
+        if isinstance(date, str) and date.strip():
+            weekday = payload.get("weekday")
+            stamp = _head_field(date)
+            if isinstance(weekday, str) and weekday.strip():
+                stamp = f"{stamp} {_head_field(weekday)}"
+            lines.append(f"  date: {stamp}")
+
+        if not lines:
+            return None
+        return "\n".join(["<background>", *lines])
+
+    @staticmethod
+    def _render_reflection(ev: _EventSnapshot) -> str | None:
+        """``agent.reflection_written`` → ``<reflection>`` 时间线行（2026-08-21）。
+
+        时刻由外层 ``<t>`` 头承载，行内不再自带写入时刻——它现在是时间线上
+        一条普通事实，"多久以前想的"由时刻头与 ``<now>`` 相减即得，和别的
+        行一个算法。正文走多行容忍位净化（换行 + 两空格缩进），保证动态内容
+        到不了列 0。
+
+        正文为空时返回 None（不渲染空行）。
+        """
+        text = (ev.payload or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        return f"<reflection>\n  {_ml_text(text.strip())}"
 
     @staticmethod
     def _render_context_recap(ev: _EventSnapshot) -> str:
@@ -1233,7 +1352,7 @@ class Projector:
         内部字段。钉住/不占窗口预算等投影行为在裁剪层，不在此处。"""
         payload = ev.payload or {}
         summary = str(payload.get("summary") or "").strip()
-        head = "<回忆>"
+        head = "<recall>"
         # 头字段虽由可信的 compactor 写入，仍按"一切动态文本先净化"的总则
         # 走单行净化，不让任何 payload 值裸进列 0 行头。
         frm = _inline_text(str(payload.get("covers_from_occurred_at") or "")[:16])
@@ -1253,14 +1372,14 @@ class Projector:
         kind = ev.type.replace("runtime.", "")
         payload = ev.payload or {}
         if not payload:
-            return f"<系统>{_esc_text(kind)}"
-        return f"<系统>{_esc_text(kind)} {_esc_text(_safe_json(payload))}"
+            return f"<system>{_esc_text(kind)}"
+        return f"<system>{_esc_text(kind)} {_esc_text(_safe_json(payload))}"
 
     @staticmethod
     def _render_ingest_failure(ev: _EventSnapshot) -> str:
         """Render only the safe summary, never the raw NapCat audit payload."""
         payload = ev.payload or {}
-        parts = ["<系统>event_ingest_failed"]
+        parts = ["<system>event_ingest_failed"]
 
         source_type = payload.get("source_event_type")
         if source_type:
@@ -1303,7 +1422,7 @@ class Projector:
 
     @staticmethod
     def _render_reply_task_completed(ev: _EventSnapshot) -> str:
-        """runtime.reply_task_completed → ``<等待结束>`` 极简行。
+        """runtime.reply_task_completed → ``<wait_ended>`` 极简行。
 
         只陈述"这段等待结束了"这一件事；没有授权 ID、unseen、consumed 或
         expires_at——命名刻意不表达任何发言权限（v2.0/30-工具设计/发言链路
@@ -1311,7 +1430,7 @@ class Projector:
         就该低到只是一次叫醒，该说什么去读它上面的时间线。
         """
         payload = ev.payload or {}
-        head = f"<等待结束>{_head_field(str(payload.get('reply_task_id') or ''))}"
+        head = f"<wait_ended>{_head_field(str(payload.get('reply_task_id') or ''))}"
         revision = payload.get("revision")
         if revision:
             head += f" r{_head_field(str(revision))}"
@@ -1319,13 +1438,13 @@ class Projector:
 
     @staticmethod
     def _render_reply_flushed(ev: _EventSnapshot) -> str:
-        """旧链路 runtime.reply_flushed → ``<旧发言>`` 行块（仅历史兼容渲染）。
+        """旧链路 runtime.reply_flushed → ``<legacy_reply>`` 行块（仅历史兼容渲染）。
 
-        现役发言不产生本行：一次发送的记录就是它的 ``<工具>send_messages``
+        现役发言不产生本行：一次发送的记录就是它的 ``<tool>send_messages``
         行（气泡 + 结果回执）。
         """
         payload = ev.payload or {}
-        head = "<旧发言>"
+        head = "<legacy_reply>"
         task_id = payload.get("reply_task_id")
         if task_id:
             head += f"{_head_field(str(task_id))} "
@@ -1391,8 +1510,49 @@ def render_timeline_stream(items: Sequence[TimelineItem]) -> list[str]:
 # 出现率低、替换后形近，换来行头文法内无用户可控定界字符）。
 
 
+def _task_note_of(payload: object) -> str | None:
+    """``agent.task_note_written`` 载荷 → 便签正文，空/缺失一律 None。
+
+    窗口折叠与库查询共用一个解析，两条路径不会对同一条事件给出不同答案。
+    """
+    if not isinstance(payload, dict):
+        return None
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return None
+    content = content.strip()
+    return content or None
+
+
+# bot 在群里的身份闭集。跑期对闭集外的值一律降级为 None——不让来路不明的
+# 角色字符串进信封（<background> 行与 DecisionContext.bot_role 共用本集合）。
+_BOT_ROLES = frozenset({"owner", "admin", "member"})
+
+
 def _esc_text(s: str) -> str:
+    """结构字符转义：``& < >``。**不含** ``[ ]``。
+
+    JSON 序列化结果（工具参数/结果、载荷兜底）也走这里，而 JSON 数组本来就用
+    方括号——把它一并转义会把每个数组打成 ``&lsqb;…&rsqb;``，模型每拍都要读
+    这些行。方括号的转义因此按位置收窄，见 ``_esc_inline``。
+    """
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _esc_inline(s: str) -> str:
+    """**正文位**转义：``& < >`` 再加内联段定界符 ``[ ]``（2026-08-21）。
+
+    内联段（``[img …]`` / ``[@ …]`` / ``[card …]``…）只出现在消息正文与引用摘要
+    里，方括号也只在那两处具有结构含义。用户直接打一行
+    ``[img aabbccddeeff : 无害图片]`` 就能伪造一张图——这是可注入面，不是风格
+    问题（渲染格式表 §五2 实施前置条件）。
+
+    转义形态沿用正文位既有的实体风格（``&lt;`` 同族），不用全角替换：正文是
+    用户原话，替换字符会悄悄改写他说的内容，而实体至少是可还原的标注。
+    行头短字段走另一条路（``_head_field`` 的全角定界净化），那里字段短、
+    可读性优先。
+    """
+    return _esc_text(s).replace("[", "&lsqb;").replace("]", "&rsqb;")
 
 
 def _ml_text(s: str) -> str:
@@ -1401,6 +1561,22 @@ def _ml_text(s: str) -> str:
     缩进续行从属于所在行（Part 3 §2.1），保证动态内容永远到不了列 0。"""
     normalized = s.replace("\r\n", "\n").replace("\r", "\n")
     return _esc_text(normalized).replace("\n", "\n  ")
+
+
+def _seg_field(s: str) -> str:
+    """内联段 ``[…]`` 内部的单行字段位：压平 + 转义（含 ``[ ]``）。
+
+    段内自由文本（图片描述、文件名、表情名、卡片标题…）里出现一个 ``]``
+    就能提前闭合本段，后半截变成正文——与正文位同一类可注入面，用同一套
+    转义堵住。
+    """
+    return _esc_inline(_flatten(s))
+
+
+def _ml_inline(s: str) -> str:
+    """``_ml_text`` 的正文位版本：额外转义 ``[ ]``。消息正文段专用。"""
+    normalized = s.replace("\r\n", "\n").replace("\r", "\n")
+    return _esc_inline(normalized).replace("\n", "\n  ")
 
 
 def _flatten(s: str) -> str:
@@ -1414,10 +1590,23 @@ def _inline_text(s: str) -> str:
 
 
 _HEAD_FIELD_TABLE = str.maketrans(
-    {"(": "（", ")": "）", "/": "／", ":": "：", "#": "＃", "@": "＠"}
+    {
+        "(": "（",
+        ")": "）",
+        "/": "／",
+        ":": "：",
+        "#": "＃",
+        "@": "＠",
+        # 2026-08-21：内联段改用 [ ] 定界后，行头里的方括号同样要中和——
+        # 名字叫 "张三[img aabbccddeeff : x]" 时行头会长出一张假图。
+        "[": "［",
+        "]": "］",
+    }
 )
 
-_EXCERPT_TABLE = str.maketrans({":": "：", "「": "『", "」": "』"})
+_EXCERPT_TABLE = str.maketrans(
+    {":": "：", "「": "『", "」": "』", "[": "［", "]": "］"}
+)
 
 
 def _head_field(s: str) -> str:
@@ -1427,18 +1616,45 @@ def _head_field(s: str) -> str:
     return _esc_text(_flatten(s)).translate(_HEAD_FIELD_TABLE)
 
 
-def _decision_anchor(ev: _EventSnapshot) -> str:
-    """program terminal → `` ev:<决策事件ID>``；查不到来源时返回空串。"""
-    decision_id = (ev.payload or {}).get("decision_id") or ev.causation_id
-    if not decision_id:
+def _program_hash_part(ev: _EventSnapshot) -> str:
+    """program terminal → `` <hash12>``；缺失时返回空串。
+
+    与 ``_decision_anchor`` 合起来构成一次运行的唯一身份。历史事件（2026-08-21
+    之前写的 terminal）没有这个键，退化为只有 ``ev:`` 的旧形态，不报错。
+    """
+    program_hash = (ev.payload or {}).get("program_hash")
+    if not isinstance(program_hash, str) or not program_hash:
         return ""
-    return f" ev:{_head_field(str(decision_id))}"
+    return f" {_head_field(program_hash)}"
+
+
+def _decision_anchor(ev: _EventSnapshot) -> str:
+    """program terminal → `` ev:<调度事件ID>``；查不到来源时返回空串。
+
+    优先取 ``payload.dispatch_event_id``（下达 execute_program 的那一拍），
+    退回 ``payload.decision_id`` / ``causation_id``——空程序在自己那一拍收口，
+    没有调度事件，回指的就是它自己。
+    """
+    payload = ev.payload or {}
+    anchor_id = (
+        payload.get("dispatch_event_id")
+        or payload.get("decision_id")
+        or ev.causation_id
+    )
+    if not anchor_id:
+        return ""
+    return f" ev:{_head_field(str(anchor_id))}"
 
 
 def _quote_excerpt(s: str, *, limit: int = 40) -> str:
     """摘要/留言的 ``「…」`` 引用位：压平 + 截断 + 转义 + N2 净化
-    （半角冒号→全角、内层「」→『』——冒号防提前终止行头，引号防提前
-    闭合引用位）。"""
+    （半角冒号→全角、内层「」→『』、方括号→全角——冒号防提前终止行头，
+    引号防提前闭合引用位，方括号防伪造内联段）。
+
+    2026-08-21 加入方括号：内联段改用 ``[…]`` 定界后，引用摘要里若留下半角
+    方括号，一条被引用的消息就能在摘要位置伪造出一张图。全角化同时中和了
+    ``_segment_gloss`` 自己产出的 ``[图片]`` 一类占位——这是有意的：摘要里
+    不存在真的内联段，全都该是全角。"""
     flat = _clip(_flatten(s), limit)
     return f"「{_esc_text(flat).translate(_EXCERPT_TABLE)}」"
 
@@ -1477,6 +1693,25 @@ def _hash12(value: object) -> str:
     if _HEX_HASH_RE.fullmatch(text):
         return text[:12]
     return _inline_text(text[:24])
+
+
+def _record_seconds(d: dict) -> int | None:
+    """OneBot record 段的时长（秒）。取不到返回 None，**不编数字**。
+
+    napcat 上报字段名不统一（``duration`` / ``seconds`` / ``time``），逐个试；
+    非正整数视为未知。转录不在本函数职责内——语音转录尚未实现（2026-08-21）。
+    """
+    for key in ("duration", "seconds", "time"):
+        raw = d.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            secs = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if secs > 0:
+            return secs
+    return None
 
 
 def _human_size(value: object) -> str | None:
@@ -1523,7 +1758,8 @@ def _spoken_bubble_text(content: object) -> str | None:
     """**迁移前**的 chat 气泡段数组 → 单条人话文本（2026-08-14 前的事件）。
 
     形状不识 → None（调用方整体退回 JSON 通用行）。text 段转义后换行缩进；
-    at/回复/表情用行文法记号。新形状走 ``_domain_bubble_text``。"""
+    at/回复/表情用行文法记号，与消息体同一套内联段词汇（2026-08-21 起
+    ``[@ (QQ)]`` / ``[face ID]``）。新形状走 ``_domain_bubble_text``。"""
     if not isinstance(content, list) or not content:
         return None
     parts: list[str] = []
@@ -1534,13 +1770,13 @@ def _spoken_bubble_text(content: object) -> str | None:
         data = data if isinstance(data, dict) else {}
         seg_type = seg.get("type")
         if seg_type == "text":
-            parts.append(_ml_text(str(data.get("text", ""))))
+            parts.append(_ml_inline(str(data.get("text", ""))))
         elif seg_type == "at":
-            parts.append(f"@{_esc_text(str(data.get('qq', '')))}")
+            parts.append(f"[@ ({_seg_field(str(data.get('qq', '')))})]")
         elif seg_type == "reply":
-            parts.append(f"回复#{_esc_text(str(data.get('id', '')))}")
+            parts.append(f"回复#{_head_field(str(data.get('id', '')))}")
         elif seg_type == "face":
-            parts.append(f"<表情{_esc_text(str(data.get('id', '')))}>")
+            parts.append(f"[face {_seg_field(str(data.get('id', '')))}]")
         else:
             return None
     return "".join(parts)
@@ -1550,8 +1786,8 @@ def _domain_bubble_text(bubble: dict) -> str | None:
     """领域形状 chat 气泡（2026-08-14 起）→ 单条人话文本。
 
     渲染顺序与 ``outbound_messages.build_chat_content`` 的段顺序一致
-    （reply → at → text → face），记号沿用行文法：``回复#ID`` / ``@QQ`` /
-    ``<表情ID>``。四个键全缺 → None，调用方退回 JSON 通用行。"""
+    （reply → at → text → face），记号沿用行文法：``回复#ID`` / ``[@ (QQ)]`` /
+    ``[face ID]``。四个键全缺 → None，调用方退回 JSON 通用行。"""
     parts: list[str] = []
     # 参数气泡（`agent.tool_called`）渲染的是模型原样写的值，未经 validate_messages
     # 归一：schema 允许 reply/at/face 写成整数，这里不能只认字符串。
@@ -1559,16 +1795,16 @@ def _domain_bubble_text(bubble: dict) -> str | None:
     if isinstance(reply, (str, int)) and not isinstance(reply, bool):
         reply = str(reply).strip()
         if reply:
-            parts.append(f"回复#{_esc_text(reply)}")
+            parts.append(f"回复#{_head_field(reply)}")
     at = bubble.get("at")
     for qq in at if isinstance(at, list) else ([at] if at is not None else []):
-        parts.append(f"@{_esc_text(str(qq))}")
+        parts.append(f"[@ ({_seg_field(str(qq))})]")
     text = bubble.get("text")
     if isinstance(text, str) and text:
-        parts.append(_ml_text(text))
+        parts.append(_ml_inline(text))
     face = bubble.get("face")
     for fid in face if isinstance(face, list) else ([face] if face is not None else []):
-        parts.append(f"<表情{_esc_text(str(fid))}>")
+        parts.append(f"[face {_seg_field(str(fid))}]")
     return "".join(parts) if parts else None
 
 
@@ -1611,7 +1847,7 @@ def _render_bubble_line(bubble: object, receipt: object = None) -> str | None:
 
 
 def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str | None:
-    """``<工具>send_messages`` 行块：头行 + 逐气泡行（终态带回执）。
+    """``<tool>send_messages`` 行块：头行 + 逐气泡行（终态带回执）。
 
     任一环节形状不识（旧事件 / 空 messages / 回执缺失且参数不识）→ None，
     调用方退回通用 JSON 渲染，事实不消失。"""
@@ -1622,7 +1858,7 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
     if tv is not None and tv.error_kind == "pending":
         if not arg_bubbles:
             return None
-        lines = ["<工具>send_messages 已调用"]
+        lines = ["<tool>send_messages 已调用"]
         for bubble in arg_bubbles:
             line = _render_bubble_line(bubble)
             if line is None:
@@ -1633,7 +1869,7 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
     if tv is None:
         if not arg_bubbles:
             return None
-        lines = ["<工具>send_messages 失败 interrupted status=uncertain"]
+        lines = ["<tool>send_messages 失败 interrupted status=uncertain"]
         for bubble in arg_bubbles:
             line = _render_bubble_line(bubble)
             if line is None:
@@ -1647,7 +1883,7 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
         receipts = result.get("sent_messages")
         if not isinstance(receipts, list) or not receipts:
             return None
-        lines = ["<工具>send_messages 完成"]
+        lines = ["<tool>send_messages 完成"]
         for receipt in receipts:
             line = _render_bubble_line(receipt, receipt=receipt)
             if line is None:
@@ -1657,7 +1893,7 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
 
     extra = tv.error_extra or {}
     head_extra = {key: value for key, value in extra.items() if key != "sent_messages"}
-    head = "<工具>send_messages 失败" + _error_head_suffix(
+    head = "<tool>send_messages 失败" + _error_head_suffix(
         tv.error_kind,
         head_extra,
     )
@@ -1684,9 +1920,11 @@ def _render_send_messages_call(args: object, tv: "ToolResultView | None") -> str
 
 
 # agent.tool_failed.payload 顶层的"信封字段"——不属于结构化失败附加信息（extra）。
-# 工具执行层把 payload 拼成 {tool_call_id, tool_name, task_id, error_kind,
+# 工具执行层把 payload 拼成 {tool_call_id, tool_name, error_kind,
 # error_message, **outcome.extra}，fold_tool_results 据此把其余键收进
 # ToolResultView.error_extra，再由 _render_error_element 透给 LLM。
+# ``task_id`` 保留在集合里：新写入已不带它（2026-08-21 任务坍缩），但库里的
+# 存量失败行还有，不过滤会让老行在信封里多长出一个 task_id=... 的 k=v。
 _TOOL_FAILED_ENVELOPE_KEYS = frozenset(
     {"tool_call_id", "tool_name", "task_id", "error_kind", "error_message"}
 )
@@ -1704,10 +1942,16 @@ def _extract_error_extra(payload: dict) -> dict | None:
     return extra or None
 
 
+# program terminal 载荷里**已经被行头渲染过**的键。漏一个就会在失败行尾
+# 多出一个 k=v 重复同一份信息（2026-08-21：program_hash / dispatch_event_id
+# 随资产语义新增，当时忘了加进来——行头已有 `hash ev:X`，尾部再来一遍）。
+# 新增任何进 program terminal 载荷的结构字段时，必须同步这个集合。
 _PROGRAM_FAILED_ENVELOPE_KEYS = frozenset(
     {
         "decision_id",
         "program_sha256",
+        "program_hash",
+        "dispatch_event_id",
         "duration_ms",
         "query_calls",
         "effect_call_ids",
@@ -1743,7 +1987,7 @@ def _error_head_suffix(
     error_extra: dict | None = None,
 ) -> str:
     """工具失败行头的尾缀：`` kind k=v …``。人类可读原因由调用方另起
-    ``原因`` 缩进行。timeline ``<工具>`` 行的失败渲染唯一入口。
+    ``原因`` 缩进行。timeline ``<tool>`` 行的失败渲染唯一入口。
 
     ``error_extra``（required_tier / actual_tier / required_bot_role /
     actual_bot_role / retcode / action / allowed_scopes ...）是工具失败时
@@ -1837,15 +2081,19 @@ def _render_segments(
     """把 OneBot V11 段数组翻译成行文法内联段 + 收集已落盘的 ImageRef。
 
     支持的段类型 → 形态（一律"缺失=未知/不适用"，语义与 envelope.md 的
-    "内联段"一一对应，两处必须同步改。渲染器结构以 ``<`` 开头、动态文本
-    经 ``_esc_text``——字符级不可伪造；@ 是唯一例外，用户手打的 @ 本就是
-    点名，拟态无害）：
+    "内联段"一一对应，两处必须同步改）。
+
+    2026-08-21 起内联段定界符由 ``<…>`` 改为 ``[…]``（渲染格式表 §五2）。
+    与之配套：正文位走 ``_ml_inline`` / 段内字段位走 ``_seg_field``，两者都
+    在 ``& < >`` 之外**额外转义 ``[ ]``**——否则用户手打
+    ``[img aabbccddeeff : 无害图片]`` 就能凭空造出一张图。旧形态靠 ``<`` 已在
+    转义集里才安全，换定界符必须同时换转义集，这是可注入面不是风格问题。
       text     → 原文（转义 + 换行缩进续行）
-      at       → ``@名字(QQ)`` / ``@(QQ)`` / ``@全体``（QQ 与出站段
+      at       → ``[@ 名字(QQ)]`` / ``[@ (QQ)]`` / ``[@ 全体]``（QQ 与出站段
                  data.qq 同域，模型可直抄；本账号缀 *）
       reply    → 正常路径已在 _render_message 上提为行头标记；此处兜底
                  内联渲染同一标记（防未上提的调用方）
-      image    → ``<图 hash12 照片|贴图: 描述或外显文案>``
+      image    → ``[img hash12 照片|贴图 : 描述或外显文案]``
                  hash 为 12 位展示前缀（§7，工具按前缀唯一匹配）。
                  kind：napcat data.sub_type 0→照片，1→贴图，或
                  data.emoji_id 存在→贴图（商城表情——napcat 接收侧 mface
@@ -1853,12 +2101,12 @@ def _render_segments(
                  正文位描述优先取 desc（ingest 期 VLM 客观转录——纯文本
                  模型看图的**唯一**途径，未描述成功则退 summary 外显文案，
                  模型知道有图但看不到内容，可调 look_at_image 补看）。
-      face     → ``<表情N 名>``（QQ 原生黄豆表情；名取 napcat
+      face     → ``[face N : 名]``（QQ 原生黄豆表情；名取 napcat
                  data.raw.faceText，LLM 背不出表情 id 表）
-      mface    → ``<表情 名>``（兼容非 napcat 实现；无 id）
-      record   → ``<语音>``            (LLM 当前不消费语音内容)
+      mface    → ``[face : 名]``（商城表情；无 id）
+      record   → ``[voice Ns]`` / ``[voice]``（只给时长，**不转录**）
       video    → ``<视频>``            (同上)
-      file     → ``<文件 名 大小 id:X>``（大小人性化；id 是 napcat 文件
+      file     → ``[file 名 (大小) id:X]``（大小人性化；id 是 napcat 文件
                  凭证，供未来的文件下载类工具回填）
       poke     → ``<拍一拍 目标(QQ)>``（napcat 群内拍一拍段不带目标 →
                  ``<拍一拍>``）
@@ -1867,10 +2115,10 @@ def _render_segments(
       markdown → ``<markdown>正文``（超 _MAX_MARKDOWN_CHARS 截断加 "…"）
       forward  → ``<聊天记录 id:X>``
       json     → ark 卡片，走 _render_card_segment 解析出
-                 ``<卡片 app「外显」标题 描述 url>``；解析不出任何字段才
-                 回退 ``<卡片 原始json>``
+                 ``[card app 「外显」 标题 描述 url]``；解析不出任何字段才
+                 回退 ``[card 原始json]``
       share    → 同卡片渲染（OneBot 标准段；napcat 不产生，兼容保留）
-      xml      → ``<卡片 原始xml>``（napcat 收发均不产生，兼容保留）
+      xml      → ``[card 原始xml]``（napcat 收发均不产生，兼容保留）
       其他     → ``<未识别段 类型>``
 
     image segment 的富化字段 (file_hash / local_path / mime / downloaded /
@@ -1887,20 +2135,21 @@ def _render_segments(
         t = seg.get("type")
         d = seg.get("data") or {}
         if t == "text":
-            parts.append(_ml_text(str(d.get("text", ""))))
+            # 正文位：额外转义 [ ]，否则用户直接打 [img …] 就能伪造内联段。
+            parts.append(_ml_inline(str(d.get("text", ""))))
         elif t == "at":
             qq = str(d.get("qq", "")).strip()
             if qq == "all":
-                parts.append("@全体")
+                parts.append("[@ 全体]")
             elif qq:
                 disp = _qq_disp(qq, bot_user_id)
                 nm = name_by_user_id.get(qq)
                 if nm:
-                    parts.append(f"@{_head_field(nm)}({disp})")
+                    parts.append(f"[@ {_head_field(nm)}({disp})]")
                 else:
-                    parts.append(f"@({disp})")
+                    parts.append(f"[@ ({disp})]")
             else:
-                parts.append("@(?)")
+                parts.append("[@ (?)]")
         elif t == "reply":
             parts.append(
                 _render_reply_marker(
@@ -1911,7 +2160,7 @@ def _render_segments(
                 )
             )
         elif t == "image":
-            inner = "<图"
+            inner = "[img"
             file_hash = seg.get("file_hash")
             if file_hash:
                 inner += f" {_hash12(file_hash)}"
@@ -1933,76 +2182,80 @@ def _render_segments(
             description = str(seg.get("description") or "").strip()
             summary = str(d.get("summary") or "").strip()
             if description:
-                inner += ": " + _esc_text(
+                inner += " : " + _esc_inline(
                     _clip(_flatten(description), _MAX_IMAGE_DESC_CHARS)
                 )
             elif summary:
-                inner += f": {_esc_text(_clip(_flatten(summary), 50))}"
-            parts.append(inner + ">")
+                inner += f" : {_seg_field(_clip(summary, 50))}"
+            parts.append(inner + "]")
         elif t == "face":
             fid = str(d.get("id", "")).strip()
             fname = _face_name(d)
             if fid and fname:
-                parts.append(f"<表情{_inline_text(fid)} {_inline_text(fname)}>")
+                parts.append(f"[face {_seg_field(fid)} : {_seg_field(fname)}]")
             elif fid:
-                parts.append(f"<表情{_inline_text(fid)}>")
+                parts.append(f"[face {_seg_field(fid)}]")
             else:
-                parts.append("<表情>")
+                parts.append("[face]")
         elif t == "mface":
-            # 商城/魔法表情（动图贴纸）。summary 是人类可读释义（如 "[羡慕]"），
-            # 是 LLM 唯一能理解的语义；缺失时退化为 <表情>。
+            # 商城/魔法表情（动图贴纸）。summary 是人类可读释义（如 "羡慕"），
+            # 是 LLM 唯一能理解的语义；没有 id，缺 summary 时退化为 [face]。
             summary = str(d.get("summary", "")).strip()
             if summary:
-                parts.append(f"<表情 {_esc_text(_flatten(summary))}>")
+                parts.append(f"[face : {_seg_field(summary)}]")
             else:
-                parts.append("<表情>")
+                parts.append("[face]")
         elif t == "record":
-            parts.append("<语音>")
+            # 语音只渲染时长，**不转录**（2026-08-21 维护者裁定：这轮只改形态）。
+            # envelope.md 里 [voice 时长 : 转录文本] 的转录位同样未实现。
+            secs = _record_seconds(d)
+            parts.append(f"[voice {secs}s]" if secs is not None else "[voice]")
         elif t == "video":
-            parts.append("<视频>")
+            parts.append("[video]")
         elif t == "file":
-            inner = "<文件"
+            inner = "[file"
             fname = str(d.get("name", "") or d.get("file", "")).strip()
             if fname:
-                inner += f" {_esc_text(_flatten(fname))}"
+                inner += f" {_seg_field(fname)}"
             fsize = d.get("file_size")
             if fsize is not None:
                 human = _human_size(fsize)
                 if human:
-                    inner += f" {human}"
+                    inner += f" ({human})"
+            # file_id 是 napcat 侧的文件句柄，工具要用来取文件——不能省。
             file_id = d.get("file_id")
             if file_id is not None and str(file_id).strip():
-                inner += f" id:{_inline_text(str(file_id).strip())}"
-            parts.append(inner + ">")
+                inner += f" id:{_seg_field(str(file_id))}"
+            parts.append(inner + "]")
         elif t == "poke":
             target = d.get("qq") or d.get("user_id")
             if target:
                 disp = _qq_disp(str(target), bot_user_id)
-                parts.append(f"<拍一拍 目标({disp})>")
+                parts.append(f"[poke 目标({disp})]")
             else:
-                parts.append("<拍一拍>")
+                parts.append("[poke]")
         elif t == "dice":
             val = str(d.get("result", "") or d.get("value", "")).strip()
-            parts.append(f"<骰子 {_inline_text(val)}>" if val else "<骰子>")
+            parts.append(f"[dice {_seg_field(val)}]" if val else "[dice]")
         elif t == "rps":
             # 猜拳：napcat result 1=石头 2=剪刀 3=布，直接渲染词。
             val = str(d.get("result", "") or d.get("value", "")).strip()
             word = {"1": "石头", "2": "剪刀", "3": "布"}.get(val, val)
-            parts.append(f"<猜拳 {_inline_text(word)}>" if word else "<猜拳>")
+            parts.append(f"[rps {_seg_field(word)}]" if word else "[rps]")
         elif t == "markdown":
             content = str(d.get("content") or "").strip()
             if content:
                 parts.append(
-                    f"<markdown>{_ml_text(_clip(content, _MAX_MARKDOWN_CHARS))}"
+                    f"[markdown]{_ml_inline(_clip(content, _MAX_MARKDOWN_CHARS))}"
                 )
             else:
-                parts.append("<markdown>")
+                parts.append("[markdown]")
         elif t == "forward":
             fid = str(d.get("id", "")).strip()
             if fid:
-                parts.append(f"<聊天记录 id:{_inline_text(fid)}>")
+                parts.append(f"[forward id:{_seg_field(fid)}]")
             else:
-                parts.append("<聊天记录>")
+                parts.append("[forward]")
         elif t == "json":
             parts.append(_render_card_segment(d))
         elif t == "share":
@@ -2020,9 +2273,9 @@ def _render_segments(
                 card["url"] = url
             parts.append(_card_line(card, fallback="原始share"))
         elif t == "xml":
-            parts.append("<卡片 原始xml>")
+            parts.append("[card 原始xml]")
         else:
-            parts.append(f"<未识别段 {_inline_text(str(t or 'unknown'))}>")
+            parts.append(f"[unknown {_seg_field(str(t or 'unknown'))}]")
     return "".join(parts), images
 
 
@@ -2136,10 +2389,10 @@ def _parse_ark_card(d: dict) -> dict[str, str] | None:
 
 
 def _card_line(card: dict[str, str], *, fallback: str) -> str:
-    """卡片语义字段 → ``<卡片 app「外显」标题 描述 url>``。
+    """卡片语义字段 → ``[card app 「外显」 标题 描述 url]``。
 
     字段有则出、按固定顺序空格连排；外显文案（QQ 自己的单行 summary）
-    包 ``「」`` 与自由文本字段区分。全空 → ``<卡片 <fallback>>``（表示
+    包 ``「」`` 与自由文本字段区分。全空 → ``[card <fallback>]``（表示
     "未解析的原始段格式"，内容未知）。
     """
     parts: list[str] = []
@@ -2157,10 +2410,10 @@ def _card_line(card: dict[str, str], *, fallback: str) -> str:
         if key == "summary":
             parts.append(_quote_excerpt(value, limit=limit))
         else:
-            parts.append(_esc_text(clipped))
+            parts.append(_esc_inline(clipped))
     if not parts:
-        return f"<卡片 {fallback}>"
-    return f"<卡片 {' '.join(parts)}>"
+        return f"[card {fallback}]"
+    return f"[card {' '.join(parts)}]"
 
 
 def _render_card_segment(d: dict) -> str:
@@ -2393,6 +2646,12 @@ def _segment_gloss(seg: dict) -> str | None:
 
     样式对齐 QQ 会话列表习惯：非文本段用 "[语义]" 占位、@ 用 "@号"。
     返回 None = 该段对摘要无贡献（嵌套 reply 标记本身）。
+
+    这里的方括号是**半角**，但本函数的产物必然经 ``_quote_excerpt`` 落进
+    ``「…」`` 引用位，那一步会把 ``[ ]`` 一并转成全角 ``［ ］``。信封的不变式
+    因此成立：**半角 ``[`` 开头的一定是渲染器写的真内联段**，摘要里的占位与
+    用户原话都到不了那个形态。若将来有新调用方绕开 ``_quote_excerpt``，必须
+    自己补上等价的中和，否则摘要能伪造内联段。
     """
     t = seg.get("type")
     d = seg.get("data") or {}

@@ -121,8 +121,6 @@ async def init_db() -> None:
     - agent_events（append-only event stream，唯一真相源）
     - raw_events（原文绕库，满 100 清表；见 models/raw_event.py）
     - group_memories（一群一行记忆正文，UPDATE；见 models/group_memory.py）
-    - agent_tasks（任务读模型 / CQRS read model，从 agent.task_* 事件派生；
-      允许 UPDATE，可从事件流 replay 重建。见 models/agent_task.py）
     - agent_delivery_claims（历史 worker 的投递租约表；Program Effect 不再使用，
       为数据库向后兼容保留。见 models/agent_delivery_claim.py）
 
@@ -133,16 +131,19 @@ async def init_db() -> None:
     在加入 search_text 列**之前**就建过 agent_events，重启后 SELECT 会
     `UndefinedColumnError`——这里用 `ALTER TABLE IF EXISTS ADD COLUMN
     IF NOT EXISTS` 补上。第一次部署（表还没建）时这条 ALTER 是 no-op，
-    随后 create_all 直接建带 search_text 的全新表。agent_tasks 是全新表，
-    create_all 直接建，无需 ALTER 补丁。
+    随后 create_all 直接建带 search_text 的全新表。
+
+    **agent_tasks 已于 2026-08-21 移出**（渲染格式表 §一②：任务坍缩为单栏
+    便签，读模型表随之取消）。这里只是不再声明该模型，**不发 DROP TABLE**：
+    线上已建的表会原样留着、不再被读写。要不要清掉是运维决定，不该由一次
+    业务改动顺手做掉——里面是历史任务数据。
     """
     try:
         # 触发模型模块加载以注册到 Base.metadata
-        # （agent_events + raw_events + agent_tasks + agent_delivery_claims）
+        # （agent_events + raw_events + group_memories + agent_delivery_claims）
         from qqbot.models import Base  # noqa: F401
         from qqbot.models import agent_delivery_claim  # noqa: F401
         from qqbot.models import agent_event  # noqa: F401
-        from qqbot.models import agent_task  # noqa: F401
         from qqbot.models import group_memory  # noqa: F401
         from qqbot.models import raw_event  # noqa: F401
 

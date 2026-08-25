@@ -11,10 +11,7 @@
                          系统没有独立的记忆表，清了事件流记忆随之消失。
   raw_events             原文绕库短表。满 100 行会自己清。
   group_memories         一群一行记忆正文。
-  agent_tasks            任务读模型。必须与事件流同清：Projector 查它时不受
-                         取数窗口限制（models/agent_task.py），留着会让没有
-                         事件支撑的未完成任务继续出现在 <active-tasks> 里。
-  agent_delivery_claims  ToolWorker 投递租约，纯协调状态。
+  agent_delivery_claims  历史投递协调表（现役 Program Effect 不读取）。
   agent_memes            表情包收藏元数据。
   runtime_data/media/img 落盘图片文件（表情包钉住的就是这些文件，见
                          models/agent_meme.py 媒体生命周期一节）。按 sha256
@@ -29,12 +26,17 @@
 完全不碰的东西：runtime_data/prompt_snapshots/、runtime_data/api_lab/、
 logs/ —— 纯调试日志，与运行时状态无关，要清自己 rm。
 
+线上遗留的 ``agent_tasks`` 表也**不在默认清单**：任务已经坍缩为单栏便签，
+业务代码不再读写这张表。若维护者确实要清理这张历史孤儿表，显式加
+``--include-legacy-agent-tasks``；脚本只会 TRUNCATE，不会 DROP 表。
+
 用法（在服务器项目根目录，**先停掉 bot 进程**）：
     python scripts/reset_runtime.py                     # 预览 + 交互确认
     python scripts/reset_runtime.py --dry-run           # 只演练，必定回滚、不删文件
     python scripts/reset_runtime.py --yes               # 跳过确认（非交互环境）
     python scripts/reset_runtime.py --keep-media        # 保留磁盘图片文件
     python scripts/reset_runtime.py --include-captions  # 连图片描述缓存一起清
+    python scripts/reset_runtime.py --include-legacy-agent-tasks  # 清理遗留任务表
 
 TRUNCATE 保留表结构与索引，重启后 init_db() 幂等、无需任何迁移动作。
 DATABASE_URL 经 qqbot.core.database 加载（settings.py 统一读 .env，
@@ -61,12 +63,13 @@ _TABLES: tuple[tuple[str, str], ...] = (
     ("agent_events", "信息流 + 记忆摘要"),
     ("raw_events", "原文绕库（可丢）"),
     ("group_memories", "群记忆正文"),
-    ("agent_tasks", "任务读模型"),
     ("agent_delivery_claims", "投递租约"),
     ("agent_memes", "表情包收藏"),
 )
 # 仅 --include-captions 时追加
 _CAPTIONS_TABLE = ("agent_image_captions", "图片描述缓存")
+# 线上历史遗留表：业务代码已不再读写，默认不随运行时重置清理。
+_LEGACY_TASKS_TABLE = ("agent_tasks", "历史遗留任务表（已停用）")
 
 # 心跳文件 mtime 早于这个秒数才算"进程已停"。napcat 心跳默认 30s 一次，
 # 90s 给足两次丢包的余量；这只是提醒，不阻断执行。
@@ -102,7 +105,7 @@ def _warn_if_bot_running() -> None:
     if age < _HEARTBEAT_STALE_SECONDS:
         print(
             f"\n⚠️  {path.name} {age:.0f} 秒前刚被刷新，bot 进程可能仍在运行。\n"
-            "    AgentLoop 的折叠上下文与 reply 定时器都在进程内存里，"
+            "    AgentLoop 的折叠上下文与进程内计时器都在内存里，"
             "不停机清库会被新事件立刻盖回去。\n"
             "    建议先停掉 bot 再执行。"
         )
@@ -173,6 +176,7 @@ async def reset(
     assume_yes: bool,
     keep_media: bool,
     include_captions: bool,
+    include_legacy_agent_tasks: bool = False,
 ) -> int:
     # 导入即建 engine（会读 .env 并打印数据库配置日志）
     from qqbot.core.database import engine
@@ -184,6 +188,7 @@ async def reset(
             assume_yes=assume_yes,
             keep_media=keep_media,
             include_captions=include_captions,
+            include_legacy_agent_tasks=include_legacy_agent_tasks,
         )
     finally:
         await engine.dispose()
@@ -196,11 +201,16 @@ async def _reset_with_engine(
     assume_yes: bool,
     keep_media: bool,
     include_captions: bool,
+    include_legacy_agent_tasks: bool = False,
 ) -> int:
     from qqbot.services.event_ingest.media import MEDIA_IMG_DIR
 
     media_dir = _resolve_runtime_path(MEDIA_IMG_DIR)
-    wanted = list(_TABLES) + ([_CAPTIONS_TABLE] if include_captions else [])
+    wanted = list(_TABLES)
+    if include_captions:
+        wanted.append(_CAPTIONS_TABLE)
+    if include_legacy_agent_tasks:
+        wanted.append(_LEGACY_TASKS_TABLE)
 
     _warn_if_bot_running()
 
@@ -309,6 +319,11 @@ def main() -> int:
         action="store_true",
         help="连 agent_image_captions（VLM 描述缓存）一起清，默认保留",
     )
+    parser.add_argument(
+        "--include-legacy-agent-tasks",
+        action="store_true",
+        help="清理线上遗留的 agent_tasks 表（默认不清，不会 DROP 表）",
+    )
     args = parser.parse_args()
     return asyncio.run(
         reset(
@@ -316,6 +331,7 @@ def main() -> int:
             assume_yes=args.yes,
             keep_media=args.keep_media,
             include_captions=args.include_captions,
+            include_legacy_agent_tasks=args.include_legacy_agent_tasks,
         )
     )
 

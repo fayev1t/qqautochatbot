@@ -766,8 +766,7 @@ class LoopSupervisorContractTests(unittest.IsolatedAsyncioTestCase):
         await sup.stop()
         # 断言对象是"stop 后 wake 不再产生任何新语句"，故取 stop 后的基线数
         # 比对，而不要求 captured 全程为空——start() 期间可能有别的启动查询。
-        # （2026-08-21 前这里的启动查询是 task_store.backfill_recent，已随
-        # agent_tasks 读模型一并删除。）
+        # 启动阶段不再预热已删除的任务读模型；这里只保留启动查询的基线。
         baseline = len(captured)
         await sup.wake("group:1")
         await asyncio.sleep(0.02)

@@ -4,7 +4,7 @@
 - 无事件 → None
 - 单条 observed → 返回该角色
 - 多条 observed → 取最后（最新）
-- 多账号场景：payload.self_id 不匹配 bot_user_id 被忽略
+- 账号身份过滤：payload.self_id 不匹配 bot_user_id 被忽略
 - bot_user_id=None 时不过滤 self_id
 - 非 bot_role_observed 类型的事件被跳过
 - payload.role 为空/非法值时跳过
@@ -67,11 +67,23 @@ class FoldBotRoleContractTest(unittest.TestCase):
         self.assertEqual(Projector.fold_bot_role(evs), "owner")
 
     def test_self_id_filter(self) -> None:
-        # 两个 bot 同进程；只取 self_id=A 的 baseline
+        # 防御性身份过滤：只取指定 self_id 的 baseline
         evs = [
-            _ev(event_id="E1", occurred_at=_at(1), payload={"role": "owner", "self_id": "BOT_B"}),
-            _ev(event_id="E2", occurred_at=_at(2), payload={"role": "admin", "self_id": "BOT_A"}),
-            _ev(event_id="E3", occurred_at=_at(3), payload={"role": "owner", "self_id": "BOT_B"}),
+            _ev(
+                event_id="E1",
+                occurred_at=_at(1),
+                payload={"role": "owner", "self_id": "BOT_B"},
+            ),
+            _ev(
+                event_id="E2",
+                occurred_at=_at(2),
+                payload={"role": "admin", "self_id": "BOT_A"},
+            ),
+            _ev(
+                event_id="E3",
+                occurred_at=_at(3),
+                payload={"role": "owner", "self_id": "BOT_B"},
+            ),
         ]
         self.assertEqual(
             Projector.fold_bot_role(evs, bot_user_id="BOT_A"), "admin"
@@ -79,10 +91,18 @@ class FoldBotRoleContractTest(unittest.TestCase):
 
     def test_no_bot_user_id_filter(self) -> None:
         evs = [
-            _ev(event_id="E1", occurred_at=_at(1), payload={"role": "admin", "self_id": "X"}),
-            _ev(event_id="E2", occurred_at=_at(2), payload={"role": "member", "self_id": "Y"}),
+            _ev(
+                event_id="E1",
+                occurred_at=_at(1),
+                payload={"role": "admin", "self_id": "X"},
+            ),
+            _ev(
+                event_id="E2",
+                occurred_at=_at(2),
+                payload={"role": "member", "self_id": "Y"},
+            ),
         ]
-        # 不传 bot_user_id → 不过滤 → 取最后一条
+        # 不传 bot_user_id → 不过滤 → 取最后一条（启动期兼容路径）
         self.assertEqual(Projector.fold_bot_role(evs), "member")
 
     def test_other_event_types_ignored(self) -> None:

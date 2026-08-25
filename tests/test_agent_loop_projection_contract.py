@@ -3350,7 +3350,7 @@ class SendMemeAuthorIndexTests(unittest.TestCase):
 
 class SavedMemesAugmentTests(unittest.IsolatedAsyncioTestCase):
     """收藏夹补全（_augment_with_saved_memes）：查全局 agent_memes（2026-
-    07-06 起全 bot 共享，load_saved_memes 不带 scope 参数）挂到
+    07-06 起当前账号内跨聊天 scope 共享，load_saved_memes 不带 scope 参数）挂到
     ctx.saved_memes；查询失败降级为原 ctx（绝不崩 tick）；system scope
     没有聊天面，跳过查询。"""
 

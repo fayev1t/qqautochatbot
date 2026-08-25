@@ -103,7 +103,7 @@ async def caption_image(
     )
     # Prompt 快照（待办 #11）：辅助 LLM 调用同样留观测记录。图片只记
     # hash/mime/字节数（脱敏契约：base64 永不落盘）；scope_key=None——
-    # 收藏夹是全 bot 共享的，caption 不属于任何单一 scope。
+    # 收藏夹跨聊天 scope 共享，caption 不属于某个单独聊天 scope。
     snapshot: PromptSnapshot | None = None
     if should_snapshot(None):
         snapshot = PromptSnapshot(

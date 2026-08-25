@@ -89,8 +89,7 @@ def build_default_registry() -> ToolRegistry:
     # 后写的不抹掉先写的，渲染成 <reflection> 行。与 2026-08-01 删除的
     # <my-thought> 逐拍回显的区别（低频 / 有上限 / 是结论不是笔记）见
     # reflect.py docstring。
-    # 待办：任务坍缩为单栏便签后（渲染格式表 §一②），这条分工描述要改成
-    # "反思要历史、便签只要现状"，届时 latest-wins 折叠器归便签。
+    # 分工固定为：反思要历史、便签只要现状；便签 latest-wins 折叠不进入时间线。
     registry.register(ReflectTool)
     # get_recent_thoughts：跨多拍抽取程序注释。2026-08-14 起当拍源码已在
     # <action> 里，本工具不再承担找回上一拍程序的兜底。

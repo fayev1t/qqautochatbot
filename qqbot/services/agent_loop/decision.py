@@ -141,7 +141,8 @@ class DecisionContext:
     # LIMIT 1 查询兜底（同 bot_role / <recall>），不再有 agent_tasks 读模型表。
     task_note: str | None = None
     # ─── 表情包收藏夹（meme_collection 管收藏；send_messages 发送）───
-    # 全局共享的 agent_memes（2026-07-06 起全 bot 一份，created_at 倒序、
+    # 当前账号内全局共享的 agent_memes（2026-07-06 起跨聊天 scope 共用，
+    # created_at 倒序、
     # 封顶 meme_store.MAX_SAVED_MEMES 条），由 Projector.
     # _augment_with_saved_memes 注入；渲染成 `## 表情包收藏` 节，meme 工具凭
     # 其中的 hash 精确删除/换描述，并供发言时选图。空 = 不渲染。

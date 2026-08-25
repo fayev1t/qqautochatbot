@@ -2,9 +2,9 @@
 
 ## 功能
 
-`meme_collection` 管理全局共享的表情包收藏夹，支持收录、删除和重新生成
+`meme_collection` 管理当前账号内跨聊天 scope 共享的表情包收藏夹，支持收录、删除和重新生成
 描述。该工具不发送消息，也不存在发送 action；收藏表情包的发送由
-`send_messages` 的 `kind="meme"` 气泡完成。
+`send_messages` 的 `{"meme": "hash12"}` 气泡完成。
 
 收藏记录保存图片 hash、生成的中文描述、可选上下文和媒体类型。图片文件复用
 EventIngest 已落盘的内容寻址文件，不由本工具复制或删除。
@@ -55,7 +55,7 @@ hash 已存在时返回 `already_saved`，不重复生成描述。数组输入�
 ## 权限与作用域
 
 `allowed_scopes=("group","private")`，`required_permission=GUEST`，不要求
-机器人群角色。收藏夹在所有聊天 scope 之间共享；system scope 不暴露本工具。
+机器人群角色。收藏夹在当前账号的所有聊天 scope 之间共享；system scope 不暴露本工具。
 
 ## 失败
 

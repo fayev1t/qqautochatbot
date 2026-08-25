@@ -403,7 +403,7 @@ async def _invoke_vision(
 
     scene = "image_look" if kind == "image_look" else "image_description"
     # Prompt 快照：脱敏契约要求 base64 永不落盘，图片只记 hash/mime/字节数。
-    # scope_key=None —— 描述按 hash 全局共享，不属于任何单一 scope。
+    # scope_key=None —— 描述按 hash 在当前账号内共享，不属于任何单一聊天 scope。
     snapshot: PromptSnapshot | None = None
     if should_snapshot(None):
         snapshot = PromptSnapshot(

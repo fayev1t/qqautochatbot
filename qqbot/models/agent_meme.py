@@ -16,7 +16,7 @@
   留痕，审计链不依赖本表。
 
 共享语义（2026-07-06 起，事件系统设计 §11.3 例外）：
-  收藏夹全 bot 一份、所有聊天 scope 共用 —— 收藏以公共值 file_hash 为键、
+  收藏夹在当前账号内跨聊天 scope 共用 —— 收藏以公共值 file_hash 为键、
   不携带 scope 上下文，与图片文件按 hash 落盘缓存同类，属于 scope 隔离明确
   允许并要求显式标注的例外。实现：scope_key 列固定写 meme_store 的
   MEME_SCOPE_GLOBAL 哨兵（'global'），主键 (scope_key, file_hash) 退化为
@@ -38,7 +38,7 @@ from qqbot.models.base import Base
 class AgentMeme(Base):
     __tablename__ = "agent_memes"
 
-    # 联合主键。全局共享后 scope_key 恒为 MEME_SCOPE_GLOBAL 哨兵，主键退化
+    # 联合主键。当前账号内全局共享后 scope_key 恒为 MEME_SCOPE_GLOBAL 哨兵，主键退化
     # 为全局一图一条（重复保存 = ON CONFLICT DO NOTHING，工具层折
     # already_saved）；取收藏夹按 scope_key 哨兵走主键前缀，无需额外索引。
     scope_key = Column(Text, primary_key=True)

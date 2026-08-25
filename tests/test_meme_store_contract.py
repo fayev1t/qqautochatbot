@@ -1,13 +1,13 @@
 """Contract tests for meme_store（agent_memes 表情包收藏读写）。
 
-Covers（表情包工具黑盒设计.md §存储；2026-07-06 起全局共享）：
-- 全局共享：所有读写固定用哨兵 scope_key = MEME_SCOPE_GLOBAL（事件系统设计
+Covers（表情包工具黑盒设计.md §存储；2026-07-06 起当前账号内跨聊天 scope 共享）：
+- 当前账号内共享：所有读写固定用哨兵 scope_key = MEME_SCOPE_GLOBAL（事件系统设计
   §11.3 例外），insert 落 'global'、get/load 按 'global' 过滤。
 - insert_meme：INSERT ... ON CONFLICT (scope_key, file_hash) DO NOTHING；
   rowcount=1 → True（新插入），rowcount=0 → False（已存在，调用方折
   already_saved，**不覆盖**）；values 完整落所有列。
 - get_meme：按 hash 单条精确查 → MemeView（含 context_note 留档回读，供
-  meme.recaption 沿用旧语境）；未命中 → None。
+  `meme_collection(action="recaption")` 沿用旧语境）；未命中 → None。
 - load_saved_memes：created_at 倒序 + LIMIT（语句面断言）；UTC 时间
   normalize 到北京时间。
 - delete_meme（2026-07-12）：DELETE 按哨兵 scope + hash 过滤；rowcount → bool。
@@ -143,7 +143,7 @@ class InsertMemeTests(unittest.IsolatedAsyncioTestCase):
         stmt = db.statements[0]
         self.assertIsInstance(stmt, Insert)
         params = stmt.compile(dialect=postgresql.dialect()).params
-        # 全局共享：scope_key 固定落哨兵，不接受调用方传入
+        # 当前账号内共享：scope_key 固定落哨兵，不接受调用方传入
         self.assertEqual(params["scope_key"], MEME_SCOPE_GLOBAL)
         self.assertEqual(params["file_hash"], HASH_A)
         self.assertEqual(params["description"], "黑猫瞪眼，嘲讽用")
@@ -170,7 +170,7 @@ class GetMemeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.file_hash, HASH_A)
         self.assertEqual(view.description, "黑猫瞪眼，嘲讽用")
         self.assertEqual(view.saved_at, BASE)
-        # context_note 留档回读：meme.recaption 未带新语境时沿用它
+        # context_note 留档回读：recaption 未带新语境时沿用它
         self.assertEqual(view.context_note, "张三的名场面")
 
     async def test_miss_returns_none(self) -> None:
@@ -179,7 +179,7 @@ class GetMemeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(view)
 
     async def test_statement_filters_global_sentinel(self) -> None:
-        # 全局共享的实现锚点：查询按哨兵 scope_key 过滤（未迁移的旧分群行
+        # 当前账号内共享的实现锚点：查询按哨兵 scope_key 过滤（未迁移的旧分群行
         # 不可见），而不是不带 scope 条件裸查 hash。
         db = _StubDB(select_rows=[])
         await get_meme(db.factory, HASH_A)
@@ -234,7 +234,7 @@ class UpdateMemeDescriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(HASH_A, compiled.params.values())
 
     async def test_missing_row_returns_false(self) -> None:
-        # rowcount=0 = 并发被删，调用方（meme.recaption）折 unknown_meme
+        # rowcount=0 = 并发被删，调用方折 unknown_meme
         db = _StubDB(dml_rowcount=0)
         updated = await update_meme_description(
             db.factory,
@@ -269,7 +269,7 @@ class LoadSavedMemesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(MEME_SCOPE_GLOBAL, params.values())
 
     async def test_default_limit_is_capped(self) -> None:
-        # <saved-memes> 是每 tick 注入的 prompt 区，默认上限必须存在且有限。
+        # 表情包收藏是每 tick 注入的 prompt 区，默认上限必须存在且有限。
         self.assertGreater(MAX_SAVED_MEMES, 0)
         self.assertLessEqual(MAX_SAVED_MEMES, 200)
 

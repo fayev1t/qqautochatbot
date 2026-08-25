@@ -115,7 +115,7 @@ class ToolRegistryContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.register(_BadName)
 
-    def test_default_program_api_contains_exactly_active_nineteen_tools(self) -> None:
+    def test_default_program_api_contains_exactly_active_eighteen_tools(self) -> None:
         registry = build_default_registry()
         self.assertEqual(
             set(registry.names()),

@@ -16,7 +16,7 @@ delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在�
 收藏节 `<meme>hash12 …` 同一值空间；信封展示 12 位前缀，LLM 原样照抄，
 工具按前缀唯一匹配 —— 主线 Part 3 §2.2）。
 
-  save       收录 timeline 里出现过的图片进全局收藏夹。定位 EventIngest
+  save       收录 timeline 里出现过的图片进当前账号的全局收藏夹。定位 EventIngest
              已落盘的文件（内容寻址复用，不复制）→ 已收录直接 already_saved
              → 经 context 注入的 caption_image 看图生成中文描述（planner 可
              用 context_note 补聊天语境）→ 落 agent_memes。**支持批量**
@@ -33,7 +33,7 @@ delete_meme / recaption_meme 合并而来（应用户拍板"能力全集合在�
              未提供则沿用收录时留档的旧语境（"留档备将来重生成"的兑现点）。
              caption 失败不落表、旧描述保留。
 
-共享语义：收藏夹全 bot 一份、所有聊天 scope 共用（事件系统设计 §11.3
+共享语义：收藏夹在当前账号内跨聊天 scope 共用（事件系统设计 §11.3
 例外，见 meme_store 模块 docstring）——任何会话收录/删除，其余会话都可见。
 
 失败语义（全程无 raise，error_kind 见黑盒设计 §8）：
@@ -116,13 +116,13 @@ def _ambiguous_prefix_failure(prefix: str) -> ToolOutcome:
 
 
 class MemeCollectionTool(BaseTool):
-    """实现 Tool 协议。发送已并入 reply_task；这里只管理收藏。"""
+    """实现 Tool 协议；这里只管理收藏，发送由 ``send_messages`` 完成。"""
 
     name = "meme_collection"
     program_kind = "effect"
     max_call_sites = 2
     description = (
-        "管理全局共享的表情包收藏夹，不执行发送。action=save 按 image_hash "
+        "管理当前账号内共享的表情包收藏夹，不执行发送。action=save 按 image_hash "
         "收录图片并生成检索描述，支持最多 10 个 hash 的数组；action=delete 删除"
         "收藏记录；action=recaption 重新生成收藏描述。save 和 recaption 可通过 "
         "context_note 提供图片本身不包含的上下文。表情包发送由 send_messages 的 "

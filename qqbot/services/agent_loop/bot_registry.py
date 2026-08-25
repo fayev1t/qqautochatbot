@@ -6,8 +6,8 @@ register() 写进这里；Program Effect / Query 工具（send_messages / kick /
 
 不复用 v1 (group_chat.py 里的 _bot_instances)：v2 完全自包含。
 
-单进程内调用，threading.Lock 仅用于多线程安全的偏执；asyncio
-单线程场景下基本无竞争。
+缓存按进程维护；``threading.Lock`` 保护同一进程内可能出现的多线程访问。
+当前部署只绑定一个 QQ 账号，但进程拓扑由部署侧决定，跨进程协调不由本模块提供。
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def get(self_id: str | int | None) -> Any | None:
 
 
 def get_any() -> Any | None:
-    """随便拿一个 bot。单 bot 部署的便利接口。"""
+    """取当前进程登记的账号实例（当前单账号边界下的便利接口）。"""
     with _lock:
         if not _bots:
             return None

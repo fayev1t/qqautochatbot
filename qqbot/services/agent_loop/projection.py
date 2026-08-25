@@ -328,7 +328,7 @@ class Projector:
     ) -> DecisionContext:
         """收藏夹注入：全局 agent_memes → ctx.saved_memes。
 
-        收藏夹全 bot 一份、所有聊天 scope 共用（事件系统设计 §11.3 例外，
+        当前账号内收藏夹跨聊天 scope 共用（事件系统设计 §11.3 例外，
         见 meme_store 模块 docstring），查询不带 scope 过滤；scope_key 只用来
         判断"有没有聊天面"——system scope 没有（meme 工具的
         allowed_scopes 也不含它），跳过查询省一次 SQL。查询失败整段降级
@@ -368,8 +368,8 @@ class Projector:
         - visibility：runtime.bot_role_observed 默认 agent_visible，但即使未来
           调成 runtime_only 也应能取到——这是事实数据，不是给 LLM 的渲染数据。
 
-        ``bot_user_id`` 用来在多账号场景下只取本 bot 自己的 baseline；为 None
-        时不过滤 self_id（单 bot 场景 / 启动初期 bot_registry 还空）。
+        ``bot_user_id`` 用来把 baseline 绑定到当前部署的账号身份；为 None
+        时不过滤 self_id（启动初期 bot_registry 还空）。这不是账号路由机制。
         """
         from sqlalchemy import desc
 
@@ -614,8 +614,8 @@ class Projector:
     ) -> str | None:
         """Pure fold: 从事件序列里取最新一条 runtime.bot_role_observed.role。
 
-        多账号过滤：payload.self_id 必须等于 bot_user_id；bot_user_id 为 None
-        时不过滤（单 bot 部署）。事件被假设为升序排列（与 _fetch 返回一致），
+        账号身份过滤：提供 bot_user_id 时只接受相同 self_id；为 None 时不过滤
+        （启动初期尚未解析到账号）。事件被假设为升序排列（与 _fetch 返回一致），
         因此最后一条匹配即为"最新"。
         """
         latest_role: str | None = None

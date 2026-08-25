@@ -36,7 +36,7 @@ class AgentImageCaption(Base):
 
     # sha256 内容寻址，与 EventIngest 落盘布局、时间线 `<图 hash12 …>`、
     # 收藏节 `<meme>hash12` 同一值空间（信封只展示 12 位前缀，库里存完整
-    # 64 位）。不带 scope：同一张图全 bot 一份描述。
+    # 64 位）。不带 scope：同一张图在当前账号内共用一份描述。
     file_hash = Column(Text, primary_key=True)
     # VLM 产出的客观描述（画面内容 + 图上文字逐字转录）。不含语境判断——
     # 语境由 Planner 从 timeline 自己合成，见 image_description.py 模块 docstring。

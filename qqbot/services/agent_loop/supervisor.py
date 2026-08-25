@@ -200,11 +200,12 @@ class LoopSupervisor:
 
 
 def _default_bot_user_id_resolver() -> str | None:
-    """单 bot 部署的默认 resolver：从 bot_registry 取第一个已注册 self_id。
+    """Resolve the configured account's ``self_id`` from the local registry.
 
-    多账号场景（同一进程同时注册多个 Bot 实例）下应当按 scope_key 选合适的
-    bot——比如这个群里 bot A 是成员、bot B 不是——但目前 v2 还没有 scope →
-    bot 的路由表，先用单 bot 假设兜底，等真有多账号需求时再细化。
+    The current deployment contract binds this service to one QQ account, so no
+    account-to-scope routing is needed here.  The registry is process-local;
+    whether deployment uses one process or several is decided outside this
+    module and is not inferred from the account boundary.
 
     返回 None 时（启动初期，nonebot 还没把 Bot 注册进来）AgentLoop 把
     bot_user_id 保持为 None，prompt 渲染层不输出该属性；此时 LLM 仍可靠别人
